@@ -1,0 +1,16 @@
+# 统一按 LF 存库，检出时由 git 自己决定。
+# 不加这个的话，Windows 上每次 add 都会刷一屏 "LF will be replaced by CRLF" 警告，
+# 而且真正的换行漂移会淹没在噪音里看不出来。
+* text=auto eol=lf
+
+# 二进制，别做任何转换
+*.wav binary
+*.onnx binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.zip binary
+
+# 这些文件在 diff 里不该展开
+*.onnx -diff
+*.wav -diff

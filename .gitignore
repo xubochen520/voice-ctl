@@ -1,0 +1,16 @@
+# 虚拟环境与缓存
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# 模型权重（226MB，用 `voice-ctl download` 拉取，不进版本库）
+models/
+
+# 生成物：测试音频、基准明细
+assets/tts/
+assets/*.wav
+scripts/bench_e2e.json
+scripts/probe_asr.out.txt
+scripts/_tts_one.ps1

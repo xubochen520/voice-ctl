@@ -1,0 +1,209 @@
+# voice-ctl 配置
+#
+# 按住热键说话 → 本地离线识别 → 匹配动作 → 执行。
+#
+# 加一个新能力：在下面 [[action]] 段加一条即可，不用改代码。
+# handler 支持：open_app / open_path / open_url / sysctl / keys / shell
+
+[hotkey]
+# pynput 语法。可改成 <ctrl>+<alt>+j、<f9>、<ctrl>+<shift>+space 等。
+# 注意：纯 <ctrl>+space 在中文 Windows 上是输入法切换键，会被抢，所以默认加了 alt。
+keys = "<ctrl>+<alt>+space"
+min_duration_ms = 200      # 短于此时长视为误触
+max_duration_ms = 15000    # 超时强制停止，防按键卡住
+
+[audio]
+samplerate = 16000         # SenseVoice 要求，不要改
+channels = 1               # 必须单声道
+# device 留空（不写这一行）用系统默认麦克风。
+# 要用特定设备时，先跑 `voice-ctl devices` 查序号，再写 device = 3
+# 静音判据用**峰值**而不是 RMS：安静环境下的真实说话 RMS 可能低到 0.002
+# （和底噪同级），但峰值通常在 0.05 以上。用 RMS 会把小声说话静默丢掉，
+# 表现为"有时候喊了没反应"，极难查。0 = 关闭该过滤。
+min_peak = 0.01
+
+[model]
+dir = "models/sense-voice-int8"
+# language 实测对 SenseVoice 输出无影响（zh/auto/en 结果一致），保留 auto 即可
+language = "auto"
+use_itn = true             # 数字/标点正常化（"九点" → "9点" 之类）
+num_threads = 2
+provider = "cpu"           # cpu / cuda / coreml；本机 CPU 已足够（RTF≈0.04）
+
+[normalize]
+# 同音/近音误识别替换：{"识别错的写法" = "正确写法"}
+# 发现 ASR 老把某个词听错，往这里加一条即可，不用改代码。
+# 例：围信 = "微信"  记时本 = "记事本"
+# （内置了一批常见错法，见 voice_ctl/normalize.py 的 DEFAULT_SUBSTITUTIONS）
+substitutions = {}
+use_pinyin = true          # 用 pypinyin 做同音判定（装了才生效，建议装）
+
+[match]
+threshold = 80             # 别名模糊匹配阈值 0-100，越高越严格
+strip_prefixes = ["请", "帮我", "帮忙", "麻烦", "给我", "我要", "我想", "我要你", "呃", "嗯"]
+strip_suffixes = ["谢谢", "吧", "啊", "呀", "呢", "一下", "好么", "好吗"]
+
+[decision]
+# 第 1 层语义决策（Laya）。第 0 层别名匹配搞不定的口语化指令才走这里。
+#
+# 开启步骤：
+#   1. .venv\Scripts\pip install "laya[onnx]"
+#   2. voice-ctl fetch-decision          （下载 ONNX 权重，约 900MB）
+#   3. 把下面的 enabled 改成 true
+#   4. voice-ctl doctor 确认语义层显示 ✓
+#
+# 实测：6 选项零样本下判「有个文件要改一下」「把声音关小」这类口语全对，
+# 单次推理 42-58ms，加载 10.4s（只加载一次）。但它只该兜住第 0 层漏掉的输入，
+# 不该当主判据——官方 benchmark 里 20 选项意图任务是 0.451。
+enabled = false
+model = "multilingual"     # 中文务必用 multilingual；english checkpoint 中文接近随机
+min_confidence = 0.6       # 低于此值不执行，只提示。实测负样本正好落在 0.589
+onnx_dir = "models/laya-onnx/multilingual"
+
+[feedback]
+beep = true
+beep_start_hz = 880
+beep_end_hz = 1320
+beep_ms = 70
+print_result = true
+
+# --------------------------------------------------------------------------- #
+# 动作表
+# --------------------------------------------------------------------------- #
+
+[[action]]
+id = "open.wechat"
+handler = "open_app"
+aliases = ["微信", "威信", "wechat", "聊天", "发消息"]
+describe = "打开微信，用来聊天、发消息"
+# 留空则自动从注册表/常见安装路径查找；找不到时用 `voice-ctl doctor` 会提示
+target = ""
+
+[[action]]
+id = "open.browser"
+handler = "open_url"
+aliases = ["浏览器", "打开浏览器", "上网", "chrome", "谷歌浏览器"]
+describe = "打开浏览器上网"
+target = "https://www.bing.com"
+
+[[action]]
+id = "open.explorer"
+handler = "sysctl"
+aliases = ["文件夹", "资源管理器", "我的电脑", "文件管理"]
+describe = "打开文件资源管理器"
+target = "explorer"
+
+[[action]]
+id = "open.notepad"
+handler = "open_app"
+aliases = ["记事本", "notepad", "笔记本", "记录"]
+describe = "打开记事本写字"
+target = "notepad.exe"
+
+[[action]]
+id = "open.calc"
+handler = "open_app"
+aliases = ["计算器", "calc", "calculator", "算一下"]
+describe = "打开计算器"
+target = "calc.exe"
+
+[[action]]
+id = "open.terminal"
+handler = "open_app"
+aliases = ["终端", "命令行", "cmd", "powershell", "控制台"]
+describe = "打开终端命令行"
+target = "wt.exe"
+
+[[action]]
+id = "open.taskmgr"
+handler = "open_app"
+aliases = ["任务管理器", "进程管理", "taskmgr"]
+describe = "打开任务管理器"
+target = "taskmgr.exe"
+
+[[action]]
+id = "open.settings"
+handler = "open_url"
+aliases = ["设置", "系统设置", "windows设置"]
+describe = "打开 Windows 设置"
+target = "ms-settings:"
+
+[[action]]
+id = "web.bilibili"
+handler = "open_url"
+aliases = ["b站", "bilibili", "哔哩哔哩", "比利比利"]
+describe = "打开 B 站看视频"
+target = "https://www.bilibili.com"
+
+[[action]]
+id = "web.github"
+handler = "open_url"
+aliases = ["github", "代码仓库", "giuhub"]
+describe = "打开 GitHub"
+target = "https://github.com"
+
+[[action]]
+id = "sys.volume_up"
+handler = "sysctl"
+aliases = ["音量加", "声音大点", "大声点", "调高音量", "音量大"]
+describe = "调高系统音量"
+target = "volume_up"
+
+[[action]]
+id = "sys.volume_down"
+handler = "sysctl"
+aliases = ["音量减", "声音小点", "小声点", "调低音量", "音量小"]
+describe = "调低系统音量"
+target = "volume_down"
+
+[[action]]
+id = "sys.mute"
+handler = "sysctl"
+aliases = ["静音", "闭嘴", "别出声", "关声音"]
+describe = "系统静音 / 取消静音"
+target = "mute"
+
+[[action]]
+id = "sys.lock"
+handler = "sysctl"
+aliases = ["锁屏", "锁定电脑", "锁一下"]
+describe = "锁定电脑屏幕"
+target = "lock"
+
+[[action]]
+id = "sys.screenshot"
+handler = "sysctl"
+aliases = ["截屏", "截图", "屏幕截图", "抓屏"]
+describe = "截取整个屏幕"
+target = "screenshot"
+
+[[action]]
+id = "sys.show_desktop"
+handler = "sysctl"
+aliases = ["显示桌面", "回到桌面", "看桌面"]
+describe = "最小化所有窗口显示桌面"
+target = "show_desktop"
+
+# --------------------------------------------------------------------------- #
+# 例子：模拟按键（默认关闭，微信这个快捷键要自己在微信里设）
+# --------------------------------------------------------------------------- #
+
+[[action]]
+id = "wechat.hotkey"
+handler = "keys"
+aliases = ["打开微信窗口", "调出微信", "切到微信"]
+describe = "用微信的全局快捷键调出微信窗口"
+target = "ctrl+alt+w"
+enabled = false
+
+# --------------------------------------------------------------------------- #
+# 例子：跑一条命令（默认关闭；shell 有风险，开启前想清楚）
+# --------------------------------------------------------------------------- #
+
+[[action]]
+id = "custom.example"
+handler = "shell"
+aliases = ["示例命令"]
+describe = "示例：执行一条自定义命令"
+target = "echo hello from voice-ctl"
+enabled = false

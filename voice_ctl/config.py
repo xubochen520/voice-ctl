@@ -1,0 +1,439 @@
+"""配置：TOML 读取 + 校验 + 默认值。
+
+设计要点：**加一个新能力不需要改代码**——在 config.toml 里加一段 [[action]] 即可。
+只有需要全新行为（模拟按键、系统操作）才写 Python 类。
+"""
+
+from __future__ import annotations
+
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Union
+
+VALID_HANDLERS = {"open_app", "open_path", "open_url", "sysctl", "keys", "shell"}
+
+
+class ConfigError(Exception):
+    """配置非法。消息里必须说清哪个键、期望什么、实际是什么。"""
+
+
+# --------------------------------------------------------------------------- #
+# 各段
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class HotkeyConfig:
+    """全局热键。按住说话（push-to-talk），松开即停。"""
+
+    keys: str = "<ctrl>+<alt>+space"
+    """pynput 语法。'<ctrl>+<alt>+space' / '<ctrl>+<alt>+j' / '<f9>'。"""
+
+    min_duration_ms: int = 200
+    """短于此时长的按键视为误触，不触发识别。"""
+
+    max_duration_ms: int = 15000
+    """超过此时长强制停止录音，防止按键卡住导致无限录音。"""
+
+    def validate(self) -> None:
+        if not self.keys.strip():
+            raise ConfigError("[hotkey].keys 不能为空")
+        if self.min_duration_ms < 0:
+            raise ConfigError(f"[hotkey].min_duration_ms 不能为负，实际 {self.min_duration_ms}")
+        if self.max_duration_ms <= self.min_duration_ms:
+            raise ConfigError(
+                f"[hotkey].max_duration_ms ({self.max_duration_ms}) 必须大于 "
+                f"min_duration_ms ({self.min_duration_ms})"
+            )
+
+
+@dataclass
+class AudioConfig:
+    samplerate: int = 16000
+    channels: int = 1
+    device: int | str | None = None
+    """留空用系统默认输入设备。可用 `voice-ctl devices` 列出序号。"""
+
+    min_peak: float = 0.01
+    """整段峰值低于此值判为静音，直接跳过识别（0 = 关闭该过滤）。
+
+    **用峰值而不是 RMS 做静音判据**，这是个实测得出的结论：
+    安静环境下的真实说话，RMS 可能只有 0.002（和纯底噪同一量级），
+    但峰值通常在 0.05 以上。用 RMS 当阈值会把用户小声说话静默丢掉——
+    表现为"有时候喊了没反应"，极难排查。峰值判据对这两种情况区分得很干净。
+    """
+
+    def validate(self) -> None:
+        if self.samplerate != 16000:
+            raise ConfigError(
+                f"[audio].samplerate 必须是 16000（SenseVoice 要求），实际 {self.samplerate}"
+            )
+        if self.channels != 1:
+            raise ConfigError(f"[audio].channels 必须是 1（单声道），实际 {self.channels}")
+        if not 0.0 <= self.min_peak <= 1.0:
+            raise ConfigError(f"[audio].min_peak 必须在 0.0-1.0，实际 {self.min_peak}")
+
+
+@dataclass
+class ModelConfig:
+    dir: str = "models/sense-voice-int8"
+    language: str = "auto"
+    use_itn: bool = True
+    num_threads: int = 2
+    provider: str = "cpu"
+
+    def validate(self) -> None:
+        if self.language not in ("auto", "zh", "en", "ja", "ko", "yue"):
+            raise ConfigError(
+                f"[model].language 只能是 auto/zh/en/ja/ko/yue 之一，实际 {self.language!r}"
+            )
+        if self.num_threads < 1:
+            raise ConfigError(f"[model].num_threads 至少为 1，实际 {self.num_threads}")
+        if self.provider not in ("cpu", "cuda", "coreml"):
+            raise ConfigError(f"[model].provider 不支持 {self.provider!r}（cpu/cuda/coreml）")
+
+
+@dataclass
+class MatchConfig:
+    threshold: int = 80
+    """别名模糊匹配阈值 0-100。越高越严格。"""
+
+    strip_prefixes: list[str] = field(
+        default_factory=lambda: ["请", "帮我", "帮忙", "麻烦", "给我", "我要", "我想", "我要你", "呃", "嗯"]
+    )
+    """识别结果开头的口语词，匹配前剥掉。"""
+
+    strip_suffixes: list[str] = field(
+        default_factory=lambda: ["谢谢", "吧", "啊", "呀", "呢", "一下", "好么", "好吗"]
+    )
+    """结尾的语气词，匹配前剥掉。"""
+
+    inline_fillers: list[str] = field(default_factory=lambda: ["一下", "一个", "那个", "这个"])
+    """句中填充词，任意位置都删（"打开一下微信" → "打开微信"）。
+
+    只放不会出现在正式命令词里的词——「打开」这种放进来会把命令本身吃掉。
+    """
+
+    def validate(self) -> None:
+        if not 0 <= self.threshold <= 100:
+            raise ConfigError(f"[match].threshold 必须在 0-100，实际 {self.threshold}")
+
+
+@dataclass
+class DecisionConfig:
+    """第 1 层语义决策（可选）。第 0 层别名匹配搞不定时才用。"""
+
+    enabled: bool = False
+    model: str = "multilingual"
+    """务必用 multilingual：中文用 english checkpoint 接近随机。"""
+
+    min_confidence: float = 0.6
+    """低于此置信度不执行，改为提示确认。"""
+
+    onnx_dir: str = "models/laya-onnx/multilingual"
+    """Laya 的 ONNX 权重目录（放 rl_agent_config.json + tokenizer/ + *.onnx）。
+
+    相对路径按**配置文件所在目录**解析，不是当前工作目录——否则从别处
+    运行 voice-ctl 时会找不到权重。
+    """
+
+    def validate(self) -> None:
+        if not 0.0 <= self.min_confidence <= 1.0:
+            raise ConfigError(
+                f"[decision].min_confidence 必须在 0.0-1.0，实际 {self.min_confidence}"
+            )
+
+
+@dataclass
+class NormalizeCfg:
+    """文本归一化的用户覆盖项。
+
+    默认表在 normalize.py 的 DEFAULT_SUBSTITUTIONS；这里只写你要**追加或覆盖**
+    的条目，改配置不用动代码。
+    """
+
+    substitutions: dict[str, str] = field(default_factory=dict)
+    """同音/近音误识别替换：{"识别错的写法": "正确写法"}。
+
+    例：{"围信": "微信", "记时本": "记事本"}
+    发现 ASR 老是把某个词听错，往这里加一条即可，不用改代码。
+    """
+
+    use_pinyin: bool = True
+    """是否用 pypinyin 做同音判定（装了才生效；也用于匹配时的拼音键）。"""
+
+
+@dataclass
+class FeedbackConfig:
+    beep: bool = True
+    """开始/结束录音的提示音。"""
+
+    beep_start_hz: int = 880
+    beep_end_hz: int = 1320
+    beep_ms: int = 70
+
+    print_result: bool = True
+    """把 识别文本 / 匹配结果 / 是否执行 打到控制台。"""
+
+
+@dataclass
+class ActionConfig:
+    """一个可被语音触发的动作。"""
+
+    id: str
+    handler: str
+    """open_app / open_path / open_url / sysctl / keys / shell"""
+
+    aliases: list[str] = field(default_factory=list)
+    """语音里可能出现的说法，全部小写比较。第 0 层匹配靠它。"""
+
+    describe: str = ""
+    """自然语言描述，第 1 层语义决策当 criteria 用。留空则用 aliases 拼。"""
+
+    target: str = ""
+    """handler 的目标：exe 路径 / 文件夹 / URL / 系统操作名。"""
+
+    args: list[str] = field(default_factory=list)
+    """额外参数（open_app 的命令行参数、keys 的键序列等）。"""
+
+    enabled: bool = True
+
+    def validate(self) -> None:
+        if not self.id.strip():
+            raise ConfigError("[[action]] 缺少 id")
+        if self.handler not in VALID_HANDLERS:
+            raise ConfigError(
+                f"动作 {self.id!r} 的 handler={self.handler!r} 不认识；"
+                f"支持：{', '.join(sorted(VALID_HANDLERS))}"
+            )
+        if not self.aliases and not self.describe and not self.target:
+            raise ConfigError(f"动作 {self.id!r} 既没有 aliases 也没有 target，无法匹配")
+        if self.handler in ("open_path", "open_url", "shell", "sysctl") and not self.target:
+            raise ConfigError(f"动作 {self.id!r} 的 handler={self.handler} 必须提供 target")
+
+
+# --------------------------------------------------------------------------- #
+# 顶层
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class AppConfig:
+    hotkey: HotkeyConfig = field(default_factory=HotkeyConfig)
+    audio: AudioConfig = field(default_factory=AudioConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    normalize: NormalizeCfg = field(default_factory=NormalizeCfg)
+    match: MatchConfig = field(default_factory=MatchConfig)
+    decision: DecisionConfig = field(default_factory=DecisionConfig)
+    feedback: FeedbackConfig = field(default_factory=FeedbackConfig)
+    actions: list[ActionConfig] = field(default_factory=list)
+
+    source: Path | None = None
+    """配置来源文件，便于报错时指出位置。"""
+
+    def validate(self) -> None:
+        self.hotkey.validate()
+        self.audio.validate()
+        self.model.validate()
+        self.match.validate()
+        self.decision.validate()
+
+        if not self.actions:
+            raise ConfigError("配置里没有任何 [[action]]，程序无可执行的动作")
+
+        seen: set[str] = set()
+        for a in self.actions:
+            a.validate()
+            if a.id in seen:
+                raise ConfigError(f"动作 id 重复：{a.id!r}")
+            seen.add(a.id)
+
+        if not any(a.enabled for a in self.actions):
+            raise ConfigError("所有动作都是 enabled = false，程序无事可做")
+
+    @property
+    def enabled_actions(self) -> list[ActionConfig]:
+        return [a for a in self.actions if a.enabled]
+
+    def model_path(self) -> Path:
+        p = Path(self.model.dir).expanduser()
+        if not p.is_absolute() and self.source is not None:
+            p = self.source.parent / p
+        return p.resolve()
+
+    def decision_path(self) -> Path:
+        """语义层权重目录。相对路径按配置文件所在目录解析。"""
+        p = Path(self.decision.onnx_dir).expanduser()
+        if not p.is_absolute() and self.source is not None:
+            p = self.source.parent / p
+        return p.resolve()
+
+    def describe(self) -> str:
+        lines = [
+            f"配置文件   : {self.source}",
+            f"热键       : {self.hotkey.keys}  (按住说话，最短 {self.hotkey.min_duration_ms}ms)",
+            f"模型目录   : {self.model_path()}",
+            f"识别参数   : language={self.model.language} itn={self.model.use_itn} "
+            f"threads={self.model.num_threads} provider={self.model.provider}",
+            f"匹配阈值   : {self.match.threshold}",
+            f"语义决策   : {'开启' if self.decision.enabled else '关闭'}",
+            f"动作数     : {len(self.enabled_actions)} / {len(self.actions)} 启用",
+        ]
+        for a in self.enabled_actions:
+            alias = ", ".join(a.aliases[:5]) or "(无语)"
+            lines.append(f"  - {a.id:24} [{a.handler}] {alias}")
+        return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# 加载
+# --------------------------------------------------------------------------- #
+
+
+def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
+    v = raw.get(name, {})
+    if not isinstance(v, dict):
+        raise ConfigError(f"[{name}] 必须是一个表（[section]），实际是 {type(v).__name__}")
+    return v
+
+
+def _check_type(value: Any, hint: Any, where: str) -> None:
+    """按 dataclass 的注解做基础类型校验。
+
+    为什么需要：TOML 里把布尔写成字符串（`use_itn = "true"`）或把数字写成
+    字符串都能解析成功，然后一路静默地当成真值用下去——这类 bug 极难查。
+    另外 TOML 的布尔**必须小写**（`true`），写成 Python 风格的 `True` 会直接
+    是语法错误，所以这里只负责挡住"能解析但类型不对"的情况。
+    """
+    if hint is Any or hint is None:
+        return
+    origin = getattr(hint, "__origin__", None)
+    if origin is Union or str(origin) == "<class 'types.UnionType'>":  # Optional[X] / X | Y
+        for sub in getattr(hint, "__args__", ()):
+            if sub is type(None):
+                continue
+            try:
+                _check_type(value, sub, where)
+                return
+            except ConfigError:
+                continue
+        raise ConfigError(f"{where} 的类型不对（期望 {hint}，实际 {type(value).__name__}）")
+    if origin is list:
+        if not isinstance(value, list):
+            raise ConfigError(f"{where} 必须是数组，实际是 {type(value).__name__}")
+        (item_hint,) = getattr(hint, "__args__", (Any,)) or (Any,)
+        for i, item in enumerate(value):
+            _check_type(item, item_hint, f"{where}[{i}]")
+        return
+    if origin is dict:
+        if not isinstance(value, dict):
+            raise ConfigError(f"{where} 必须是表，实际是 {type(value).__name__}")
+        return
+
+    expected = {int: (int,), float: (int, float), str: (str,), bool: (bool,)}.get(hint)
+    if expected is None:
+        return
+    if hint is bool:
+        # bool 是 int 的子类，所以必须先单独判 bool，否则 True 会被当成合法 int
+        if not isinstance(value, bool):
+            raise ConfigError(
+                f"{where} 必须是布尔值 true/false（TOML 里是小写），"
+                f"实际是 {type(value).__name__}：{value!r}"
+            )
+        return
+    if hint in (int, float) and isinstance(value, bool):
+        raise ConfigError(f"{where} 期望数字，实际是布尔值 {value!r}")
+    if not isinstance(value, expected):
+        raise ConfigError(
+            f"{where} 期望 {hint.__name__}，实际是 {type(value).__name__}：{value!r}"
+        )
+
+
+def _resolved_hints(cls: Any) -> dict[str, Any]:
+    """解析 dataclass 的类型注解。
+
+    本模块有 `from __future__ import annotations`，所有注解都是**字符串**，
+    直接拿 `field.type` 去比较会永远不相等——防护会变成摆设。必须解析。
+    """
+    import sys
+    import typing
+
+    module = sys.modules[__name__]
+    try:
+        return typing.get_type_hints(cls, vars(module))
+    except Exception:  # noqa: BLE001 - 解析不了就退化为不校验
+        return {name: Any for name in cls.__dataclass_fields__}
+
+
+def _build(cls, data: dict[str, Any], section: str):
+    """按 dataclass 字段过滤未知键 + 校验类型。未知键报错而不是静默忽略。"""
+    fields = cls.__dataclass_fields__  # type: ignore[attr-defined]
+    known = set(fields)
+    unknown = set(data) - known
+    if unknown:
+        raise ConfigError(
+            f"[{section}] 有无法识别的键：{', '.join(sorted(unknown))}；"
+            f"可用键：{', '.join(sorted(known))}"
+        )
+    hints = _resolved_hints(cls)
+    for key, value in data.items():
+        _check_type(value, hints.get(key, Any), f"[{section}].{key}")
+    try:
+        return cls(**data)
+    except TypeError as e:
+        raise ConfigError(f"[{section}] 参数有误：{e}") from e
+
+
+def load_config(path: str | Path | None = None) -> AppConfig:
+    """加载配置。path 为空时依次找 ./config.toml、~/.voice-ctl/config.toml。"""
+    if path is None:
+        for cand in (Path.cwd() / "config.toml", Path.home() / ".voice-ctl" / "config.toml"):
+            if cand.is_file():
+                path = cand
+                break
+        else:
+            raise ConfigError(
+                "找不到配置文件。请用 --config 指定，或在当前目录放一份 config.toml"
+            )
+
+    p = Path(path).expanduser().resolve()
+    if not p.is_file():
+        raise ConfigError(f"配置文件不存在：{p}")
+
+    with p.open("rb") as fh:
+        try:
+            raw = tomllib.load(fh)
+        except tomllib.TOMLDecodeError as e:
+            raise ConfigError(f"TOML 语法错误（{p}）：{e}") from e
+
+    unknown_top = set(raw) - {
+        "hotkey", "audio", "model", "normalize", "match", "decision", "feedback", "action"
+    }
+    if unknown_top:
+        raise ConfigError(
+            f"顶层有无法识别的段：{', '.join(sorted(unknown_top))}；"
+            "可用：hotkey / audio / model / normalize / match / decision / feedback / action"
+        )
+
+    raw_actions = raw.get("action", [])
+    if not isinstance(raw_actions, list):
+        raise ConfigError("[[action]] 必须是数组表（双中括号）")
+
+    cfg = AppConfig(
+        hotkey=_build(HotkeyConfig, _section(raw, "hotkey"), "hotkey"),
+        audio=_build(AudioConfig, _section(raw, "audio"), "audio"),
+        model=_build(ModelConfig, _section(raw, "model"), "model"),
+        normalize=_build(NormalizeCfg, _section(raw, "normalize"), "normalize"),
+        match=_build(MatchConfig, _section(raw, "match"), "match"),
+        decision=_build(DecisionConfig, _section(raw, "decision"), "decision"),
+        feedback=_build(FeedbackConfig, _section(raw, "feedback"), "feedback"),
+        actions=[
+            _build(ActionConfig, a, f"action[{i}]")
+            for i, a in enumerate(raw_actions)
+            if isinstance(a, dict)
+        ],
+        source=p,
+    )
+    cfg.validate()
+    return cfg
