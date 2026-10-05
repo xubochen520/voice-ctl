@@ -6,13 +6,33 @@
 说「设置今天下午三点的日程我要玩游戏」就真的多一条下午三点的提醒。全程不联网、零调用成本。
 
 - **纯离线**：识别模型跑在本地，音频不出机器
-- **低开销**：无 GPU、无 torch，模型常驻约 350MB，识别 RTF≈0.04
+- **低开销**：无 GPU、不需要 torch，模型常驻约 350MB，识别 RTF≈0.04
 - **有界面**：双击就有窗口——实时日志、录热键、改动作、调参数，不用碰配置文件
 - **听得懂整句话**：「关闭微信」不会打开微信，「设置…日程」不会被当成打开设置
 - **打开任何装了的软件**：「打开QQ」不用先在配置里写一段
 - **能记日程**：说一句话就有一条会准时响的提醒，还能导出 `.ics` 进手机日历
 - **可拓展**：加一个新能力 = 在 `config.toml` 里加一段 `[[action]]`，不用改代码
 - **可解释**：`--dry-run` 能看到它听成了什么、判断走的是哪一层、为什么
+
+---
+
+## 下载
+
+最新版 **[v0.3.2](https://github.com/xubochen520/voice-ctl/releases/latest)**：
+
+| 产物 | 体积 | 说明 |
+|---|---|---|
+| [voice-ctl-0.3.2-win64-lite.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.2/voice-ctl-0.3.2-win64-lite.exe) | 84MB | **推荐**。首次用要跑一次 `voice-ctl download` 拉识别模型（226MB），之后每次启动都快一倍 |
+| [voice-ctl-0.3.2-win64-full.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.2/voice-ctl-0.3.2-win64-full.exe) | 236MB | 开箱即用，识别模型内嵌。代价是每次启动都要把 226MB 解包到临时目录 |
+
+两个都是单文件 exe，双击就出界面（命令行也一样用）。功能完全相同，只差识别模型是否内嵌。
+
+从源码跑：
+
+```powershell
+pip install -e .
+voice-ctl ui
+```
 
 ---
 
