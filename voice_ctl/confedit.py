@@ -34,6 +34,7 @@ SETTINGS_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("decision", ("enabled", "model", "min_confidence", "onnx_dir")),
     ("intent", ("enabled", "confirm_timeout")),
     ("schedule", ("enabled", "data_file", "remind_before")),
+    ("web", ("enabled", "search_fallback", "search_url")),
     ("llm", ("enabled", "endpoint", "model", "timeout", "max_candidates")),
     ("feedback", ("beep", "beep_start_hz", "beep_end_hz", "beep_ms", "print_result")),
 )
@@ -276,6 +277,11 @@ enabled = false
 model = "multilingual"
 min_confidence = 0.6
 onnx_dir = "models/laya-onnx/multilingual"
+
+[web]
+enabled = true
+search_fallback = true
+search_url = "https://www.baidu.com/s?wd={q}"
 
 [feedback]
 beep = true

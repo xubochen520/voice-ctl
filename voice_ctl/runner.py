@@ -70,6 +70,8 @@ class Runtime:
     decider: object | None = None
     app_index: Any = None
     """已安装应用索引（意图层用它理解「打开QQ」）。"""
+    web_index: Any = None
+    """站点表（意图层用它理解「打开百度」）。"""
     llm: Any = None
     """可选的小模型层（voice_ctl.llm.SlotExtractor）。"""
 
@@ -84,6 +86,9 @@ class Runtime:
             min_confidence=self.cfg.decision.min_confidence,
             app_index=self.app_index,
             intent_enabled=self.cfg.intent.enabled,
+            web_index=self.web_index,
+            web_enabled=self.cfg.web.enabled,
+            web_search=self.cfg.web.search_fallback,
             llm=self.llm,
             llm_candidates=self.cfg.llm.max_candidates,
         )
@@ -165,7 +170,14 @@ def build_runtime(
                 kind="llm",
             )
 
-    return Runtime(cfg, norm, matcher, registry, asr, decider, app_index, llm)
+    # 站点表：纯字符串比较，构建是微秒级，不用预热。
+    web_index = None
+    if cfg.web.enabled:
+        from .web import WebIndex
+
+        web_index = WebIndex()
+
+    return Runtime(cfg, norm, matcher, registry, asr, decider, app_index, web_index, llm)
 
 
 class _Emitter:

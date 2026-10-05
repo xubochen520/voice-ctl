@@ -62,6 +62,7 @@ def _cfg() -> AppConfig:
             ActionConfig(id="open.wechat", handler="open_app", aliases=["微信"],
                          target=r"E:\weixin\Weixin.exe", describe="打开微信"),
             ActionConfig(id="open.target", handler="open_target", aliases=["打开应用"]),
+            ActionConfig(id="open.web", handler="open_url", aliases=["网页", "网站"]),
             ActionConfig(id="schedule", handler="schedule", aliases=["日程", "提醒"], target="event"),
             ActionConfig(id="sys.close_app", handler="close_app", aliases=["关闭应用"]),
         ]
@@ -549,14 +550,26 @@ def test_a_configured_action_still_wins_over_the_index():
 
 
 def test_weak_alias_match_is_not_executed_when_the_intent_says_not_found():
-    """「打开QQ音乐」而没装：不许勉强命中别的动作。
+    """没装的东西不许"勉强命中"另一个**不相干**的动作。
 
-    实测 `open.browser` 会以 0.633 冒出来并**真的打开浏览器**——用户说的是
-    QQ 音乐，得到的却是一个浏览器窗口。这种"勉强命中"比不执行更糟。
+    实测 `open.browser` 会以 0.633 冒出来并**真的打开浏览器首页**——用户说的是
+    QQ 音乐，得到的却是一个必应窗口，跟他要的毫无关系。这种勉强命中比不执行更糟。
+
+    0.3.3 之后「打开QQ音乐」有了正确的去处：QQ 音乐没装，但**它的网站存在**，
+    于是打开 y.qq.com。这不是勉强命中——是同一个东西的网页版。要求仍然成立：
+    落到 `open.web` 而不是 `open.browser`，而且网址得真的是 QQ 音乐的。
     """
-    out = _pipe().process_text("打开QQ音乐", dry_run=False)
+    out = _pipe().process_text("打开QQ音乐", dry_run=True)
+    assert out.action_id != "open.browser", "不该退回一个不相干的浏览器首页"
+    assert out.action_id == "open.web", f"落到 {out.action_id} 了"
+    assert out.intent is not None
+    assert out.intent.url.startswith("https://y.qq.com"), out.intent.url
+
+
+def test_a_wildly_wrong_alias_match_is_still_refused():
+    """完全没有对应网站的名字，照旧不许勉强命中。"""
+    out = _pipe().process_text("打开阿斯顿发斯蒂芬", dry_run=False)
     assert out.action_id is None, f"不该执行 {out.action_id}"
-    assert "没找到" in out.note and "QQ音乐" in out.note
 
 
 def test_unknown_app_still_runs_when_the_user_bound_it_explicitly():

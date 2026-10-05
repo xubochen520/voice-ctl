@@ -109,6 +109,9 @@ class SettingsTab(tk.Frame):
         self._decision_model = tk.StringVar()
         self._confidence: NumberRow
         self._onnx_dir = tk.StringVar()
+        self._web_on = tk.BooleanVar()
+        self._web_search = tk.BooleanVar()
+        self._web_search_url = tk.StringVar()
         self._print_result = tk.BooleanVar()
         self._status = tk.StringVar()
         self._reload_after: str | None = None
@@ -227,6 +230,28 @@ class SettingsTab(tk.Frame):
             "它只该兜住漏网的输入，不该当主判据——官方 benchmark 里 20 选项意图任务只有 0.451。",
         ).pack(fill="x", pady=(S(8), 0))
 
+        # --- 网页 ---------------------------------------------------------
+        c5w = W.Card(root, title="网页（说得出名字就能开）")
+        c5w.pack(fill="x", pady=(S(14), 0))
+        f5w = W.Form(c5w.body)
+        f5w.pack(fill="x")
+        W.check(f5w, "认出网站名字就打开（「打开百度」）", self._web_on, bg=P["surface"]).grid(
+            row=0, column=1, sticky="w", pady=(0, S(10))
+        )
+        f5w._row = 1  # noqa: SLF001 - 上面那行是手工 grid 的，把行号接上去
+        W.check(f5w, "没收录的名字退一步用搜索", self._web_search, bg=P["surface"]).grid(
+            row=f5w._row, column=1, sticky="w", pady=(0, S(10))  # noqa: SLF001
+        )
+        f5w._row += 1  # noqa: SLF001
+        f5w.add("搜索地址", ttk.Entry(f5w, textvariable=self._web_search_url),
+                note="必须有 {q} 占位符，查询词会填进去。")
+        W.hint(
+            c5w.body,
+            "站点表是内置的（约 70 个常见站，voice_ctl/web.py），不联网。"
+            "「搜索」那一步要联网——彻底离线用就把它关掉，「打开百度」照样能用。"
+            "本机装了同名的程序时以程序为先：说「打开微信」开的是微信，不是网页。",
+        ).pack(fill="x", pady=(S(8), 0))
+
         # --- 输出 ---------------------------------------------------------
         c5 = W.Card(root, title="输出")
         c5.pack(fill="x", pady=(S(14), 0))
@@ -310,6 +335,9 @@ class SettingsTab(tk.Frame):
         self._decision_model.set(cfg.decision.model)
         self._confidence.set(cfg.decision.min_confidence)
         self._onnx_dir.set(cfg.decision.onnx_dir)
+        self._web_on.set(bool(cfg.web.enabled))
+        self._web_search.set(bool(cfg.web.search_fallback))
+        self._web_search_url.set(cfg.web.search_url)
         self._print_result.set(bool(cfg.feedback.print_result))
         self._refresh_facts()
 
@@ -366,6 +394,12 @@ class SettingsTab(tk.Frame):
             model=self._decision_model.get(),
             min_confidence=round(self._confidence.get(), 3),
             onnx_dir=self._onnx_dir.get().strip(),
+        )
+        cfg.web = replace(
+            cfg.web,
+            enabled=bool(self._web_on.get()),
+            search_fallback=bool(self._web_search.get()),
+            search_url=self._web_search_url.get().strip() or cfg.web.search_url,
         )
         cfg.feedback = replace(cfg.feedback, print_result=bool(self._print_result.get()))
         return cfg

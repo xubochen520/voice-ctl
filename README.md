@@ -9,6 +9,8 @@
 - **低开销**：无 GPU、不需要 torch，模型常驻约 350MB，识别 RTF≈0.04
 - **有界面**：双击就有窗口——实时日志、录热键、改动作、调参数，不用碰配置文件
 - **听得懂整句话**：「关闭微信」不会打开微信，「设置…日程」不会被当成打开设置
+- **说得出名字的网站就能开**：「打开百度」「打开B站」→ 对应网站；本机装了同名程序时以程序为先
+- **说错了能收回**：「打开百度网盘，呸」不执行；「打开百度，不对，打开淘宝」打开淘宝
 - **打开任何装了的软件**：「打开QQ」不用先在配置里写一段
 - **能记日程**：说一句话就有一条会准时响的提醒，还能导出 `.ics` 进手机日历
 - **可拓展**：加一个新能力 = 在 `config.toml` 里加一段 `[[action]]`，不用改代码
@@ -18,12 +20,12 @@
 
 ## 下载
 
-最新版 **[v0.3.2](https://github.com/xubochen520/voice-ctl/releases/latest)**：
+最新版 **[v0.3.3](https://github.com/xubochen520/voice-ctl/releases/latest)**：
 
 | 产物 | 体积 | 说明 |
 |---|---|---|
-| [voice-ctl-0.3.2-win64-lite.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.2/voice-ctl-0.3.2-win64-lite.exe) | 84MB | **推荐**。首次用要跑一次 `voice-ctl download` 拉识别模型（226MB），之后每次启动都快一倍 |
-| [voice-ctl-0.3.2-win64-full.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.2/voice-ctl-0.3.2-win64-full.exe) | 236MB | 开箱即用，识别模型内嵌。代价是每次启动都要把 226MB 解包到临时目录 |
+| [voice-ctl-0.3.3-win64-lite.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.3/voice-ctl-0.3.3-win64-lite.exe) | 84MB | **推荐**。首次用要跑一次 `voice-ctl download` 拉识别模型（226MB），之后每次启动都快一倍 |
+| [voice-ctl-0.3.3-win64-full.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.3/voice-ctl-0.3.3-win64-full.exe) | 236MB | 开箱即用，识别模型内嵌。代价是每次启动都要把 226MB 解包到临时目录 |
 
 两个都是单文件 exe，双击就出界面（命令行也一样用）。功能完全相同，只差识别模型是否内嵌。
 
@@ -33,6 +35,26 @@
 pip install -e .
 voice-ctl ui
 ```
+
+---
+
+## 0.3.3：说得出名字的网站就能开
+
+```powershell
+打开百度网页        # → baidu.com
+打开B站             # → bilibili.com
+打开百度网盘，呸     # → 什么都不做（用户自己收回了）
+打开浏览器并且打开百度页面   # → 两件事都做
+```
+
+内置约 70 个常见站的站点表，不联网。本机装了同名程序时**以程序为先**：
+「打开微信」开的是微信，不是网页；但「打开百度网盘」开的是网盘，而「打开百度」
+开的是 baidu.com。
+
+改口也认：「打开百度，不对，打开淘宝」会打开淘宝。一句话里说两件事也会拆开做
+（「打开记事本然后打开计算器」）。
+
+详见 [0.3.3 版本说明](docs/RELEASE-NOTES-0.3.3.md)。
 
 ---
 
@@ -721,8 +743,9 @@ voice_ctl/
 ├── hotkey.py      全局热键状态机 + 超时守护
 ├── session.py     录音会话状态机（并发路径，可单测）
 ├── normalize.py   同音替换 + 口语词剥离 + 拼音键
-├── lexicon.py     口令词表：动词 / 否定 / 客套话 / 确认否认
+├── lexicon.py     口令词表：动词 / 否定 / 客套话 / 确认否认 / 自我更正
 ├── intent.py      意图层：动词+否定+时间+对象 → 一个 Intent
+├── web.py         站点表：「打开百度」→ baidu.com（约 70 个常见站，不联网）
 ├── timeparse.py   中文时间解析：「明天下午三点半」→ datetime
 ├── matcher.py     别名匹配 + 区分字消歧 + 时间吞掉别名的安全网
 ├── appfind.py     应用定位（PATH/注册表/常见路径/开始菜单）

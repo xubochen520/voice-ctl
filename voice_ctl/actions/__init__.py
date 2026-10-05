@@ -264,12 +264,33 @@ class OpenPathAction(Action):
 
 
 class OpenUrlAction(Action):
+    """打开一个网址。
+
+    地址有两个来源，和 open_app / open_target 那一对是一个道理：
+
+      * `target` 写在配置里 —— 用户固定几个常用站（`[[action]] web.xxx`）
+      * `ctx.slots["url"]` —— 运行时解析出来的（「打开百度」→ baidu.com）
+
+    第二个来源在 0.3.3 加的。**运行时给的优先**：那是用户这句话真正的目标，
+    而配置里的 target 只是模板/兜底。
+    """
+
     handler_name = "open_url"
+
+    def _url(self, ctx: ActionContext | None) -> tuple[str, str]:
+        """返回 (网址, 显示名)。运行时给的优先——那是这句话真正的目标。"""
+        if ctx is not None:
+            slot = str(ctx.slots.get("url") or "").strip()
+            if slot:
+                return slot, str(ctx.slots.get("url_name") or slot)
+        t = self.cfg.target.strip()
+        return t, t
 
     def preflight(self) -> ActionResult:
         t = self.cfg.target.strip()
         if not t:
-            return ActionResult(False, "target 为空")
+            # 运行时才知道开哪个站，和 open.target 一样，预检只能放行
+            return ActionResult(True, "运行时才知道要开哪个站", "地址由站点表/搜索解析")
         if "://" not in t and not t.endswith(":"):
             return ActionResult(
                 True, f"{t} 看起来像域名，浏览器会补协议", "建议写成 https://..."
@@ -277,11 +298,11 @@ class OpenUrlAction(Action):
         return ActionResult(True, f"打开 {t}")
 
     def execute(self, ctx: ActionContext) -> ActionResult:
-        t = self.cfg.target.strip()
+        t, label = self._url(ctx)
         if not t:
-            return ActionResult(False, "target 为空")
+            return ActionResult(False, "没有要打开的网址", "target 为空，槽位里也没有 url")
         if ctx.dry_run:
-            return ActionResult(True, f"[dry-run] 将打开 {t}")
+            return ActionResult(True, f"[dry-run] 将打开 {label}" + (f"（{t}）" if t != label else ""))
         try:
             # webbrowser 会走系统默认浏览器；协议式 URI（ms-settings: 等）也能开
             ok = webbrowser.open(t, new=2)
@@ -291,10 +312,11 @@ class OpenUrlAction(Action):
             # 退一步用 start，能处理更多协议式 URI
             try:
                 _popen(["cmd", "/c", "start", "", t])
-                return ActionResult(True, f"已打开 {t}", "webbrowser 返回失败，改用 start")
+                return ActionResult(True, f"已打开 {label}", "webbrowser 返回失败，改用 start")
             except OSError as e:
                 return ActionResult(False, f"打开失败：{e}")
-        return ActionResult(True, f"已打开 {t}")
+        note = "搜索页（站点表里没有这个站）" if ctx.slots.get("via_search") else ""
+        return ActionResult(True, f"已打开 {label}", note)
 
 
 # --------------------------------------------------------------------------- #

@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from . import lexicon
+from . import web
 from .apps import AppHit, AppIndex, decide
 from .normalize import Normalizer
 from .timeparse import TimeSpan, parse_when, strip_spans
@@ -49,6 +50,8 @@ from .timeparse import TimeSpan, parse_when, strip_spans
 
 APP = "app"
 """开/关一个应用。"""
+WEB = "web"
+"""打开一个网页。目标是一个网址，不是本机程序。"""
 SCHEDULE = "schedule"
 """建一条日程/提醒。"""
 QUESTION = "question"
@@ -87,6 +90,12 @@ class Intent:
     """ASR 原文，一个字都没改。日程标题、日志都用它。"""
     payload: str = ""
     """剥掉动词、时间、客套话之后剩下的正文。日程标题从它里面提炼。"""
+    url: str = ""
+    """WEB 意图的目标网址。"""
+    url_name: str = ""
+    """WEB 意图里用户说的那个站名（用来显示「已打开 百度」而不是一串网址）。"""
+    via_search: bool = False
+    """是不是走了搜索兜底（站点表里没有这个名字）。"""
     question: str = ""
     """要问用户的那句话；空串表示不用问。"""
     candidates: list[AppHit] = field(default_factory=list)
@@ -349,6 +358,93 @@ def _alias_score(text: str, alias: str) -> float:
 
 
 # --------------------------------------------------------------------------- #
+# 网页解析
+# --------------------------------------------------------------------------- #
+
+DEFAULT_SEARCH = web.DEFAULT_SEARCH
+
+
+@dataclass(frozen=True)
+class WebMatch:
+    """一个解析出来的网页目标。"""
+
+    url: str
+    name: str
+    """用来显示的名字：站点表里的站点名，或搜索时用户说的那个词。"""
+    via_search: bool
+    confident: bool
+    """站点表里**确切**命中（说的是名字本身或它的别名）。
+
+    这个标志决定「打开百度」该开哪儿：本机装着「百度网盘」，而用户说的是一个
+    确切的站点名——他要的是 baidu.com，不是网盘。只有"不确切"的命中（比如
+    「百度一下」这种带了一截的）才让位给本地应用。"""
+    score: float
+    why: str
+
+
+def resolve_web(
+    name: str,
+    *,
+    index: web.WebIndex | None = None,
+    normalizer: Normalizer | None = None,
+    allow_search: bool = True,
+) -> WebMatch | None:
+    """把一个名字解析成网址。找不到返回 None。
+
+    解析顺序：**站点表 → 域名 → 搜索兜底**。
+
+    搜索兜底是刻意留的最后一手，不是第一手：它总能给出一个结果，所以一旦排前面
+    就会把所有"其实该打开本地程序"的名字也吞掉（「打开计算器」变成搜索"计算器"）。
+    调用方只在**没命中任何本地应用**、或者用户明说了「网页/官网」时才走到这里。
+    """
+    raw = lexicon.strip_punct(name)
+    if not raw:
+        return None
+    # 「百度网页」「百度官网」：剥掉类别词再查。「百度网盘」「淘宝网」不会被动到
+    # ——它们的「网」/「盘」不是类别词（见 strip_web_cue 的说明）。
+    base, had_cue = lexicon.strip_web_cue(raw)
+    q = (normalizer or Normalizer()).normalize(base) if normalizer else base
+
+    idx = index or web.WebIndex()
+    hit = idx.find(q)
+    if hit is not None:
+        site, matched, quality, score = hit
+        # 「确切」= 用户说的就是这个站，或者只多了一个弱尾巴（「淘宝网」）。
+        # 「百度一下」那种往里塞了别的东西的（contained）不算——多出来的那截
+        # 可能就是另一个应用的名字。
+        confident = quality in ("exact", "suffix")
+        return WebMatch(
+            url=site.url,
+            name=site.name,
+            via_search=False,
+            confident=confident,
+            score=score,
+            why=f"站点表命中「{matched}」（{quality} {score:.2f}）"
+            + ("，你说了网页/官网" if had_cue else ""),
+        )
+
+    if web.looks_like_domain(q):
+        return WebMatch(
+            url=web.normalize_url(q), name=q, via_search=False,
+            confident=True, score=1.0, why="看起来是个域名，直接用",
+        )
+
+    if allow_search and (had_cue or len(q) >= 2):
+        # 只有用户明确要网页、或者名字够长时才兜底搜索。一个字的名字（「打开X」）
+        # 十有八九是在说一个装了的程序，搜索会把它的失败原因掩盖掉。
+        return WebMatch(
+            url=web.search_url(q),
+            name=raw,
+            via_search=True,
+            confident=False,
+            score=0.5,
+            why=f"站点表里没有「{q}」，改用搜索"
+            + ("（你说了网页/官网）" if had_cue else ""),
+        )
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # 主入口
 # --------------------------------------------------------------------------- #
 
@@ -360,11 +456,35 @@ def interpret(
     actions: list | None = None,
     normalizer: Normalizer | None = None,
     now: datetime | None = None,
+    web_index: web.WebIndex | None = None,
+    web_enabled: bool = True,
+    web_search: bool = True,
 ) -> Intent | None:
-    """读一句话，返回意图；读不懂返回 None（下游还有别名匹配兜着）。"""
+    """读一句话，返回意图；读不懂返回 None（下游还有别名匹配兜着）。
+
+    `web_enabled` / `web_search` 来自配置的 `[web]` 段。站点表本身不联网，
+    所以即使关掉搜索兜底也仍然能开「打开百度」。
+    """
     norm = (normalizer or Normalizer()).normalize(text)
     if not norm:
         return None
+
+    # 0) 自我更正优先于一切，包括否定。
+    #
+    #    「打开百度网盘，呸」和「打开百度，不对，打开淘宝」都要求**先**处理这句
+    #    里用户自己的改口，否则后面每一步（否定、日程、动词、对象解析）拿到的
+    #    都是用户已经撤回的那半句。用户亲口说过"呸"却被执行了，是最伤信任的
+    #    一类错误，所以它排在最前面。
+    usable, voided = lexicon.detect_correction(norm)
+    if voided:
+        return Intent(
+            "none", "negate", source=text, payload=norm,
+            why="听到你改口了（说「呸」「不对」之类），这句不执行",
+        )
+    if usable != norm:
+        # 用户改口之后说的那句才是真命令，后面全部按它走
+        norm = usable
+        text = usable
 
     # 1) 否定优先于一切：「不要打开记事本」里的「打开」是动词，
     #    但整句的意思是不做。顺序反了就会把否定句执行掉。
@@ -419,6 +539,44 @@ def interpret(
         norm.startswith(v) for v in lexicon.OPEN_VERBS if len(v) > 1
     )
     app, hits = resolve_app(obj, index=index, actions=actions, normalizer=normalizer)
+
+    # 4b) 本地找不到，或者用户明说了「网页/官网」→ 试试当网址打开。
+    #
+    #     顺序是刻意的：**先本地后网络**。「打开微信」必须开本机的微信，不能去
+    #     开 weixin.qq.com；只有本地确实没有（「打开百度」——本机没装百度客户端
+    #     很正常）或者用户点明了要网页时，才走这条路。
+    if web_enabled:
+        _base, wants_web = lexicon.strip_web_cue(obj)
+        w = resolve_web(
+            obj, index=web_index, normalizer=normalizer, allow_search=web_search
+        )
+        # 本地命中 vs 网页命中，谁赢？
+        #
+        # 判据是**用户说的名字有多确切**，不是谁分数高（两边的分数量纲不一样）：
+        #
+        #   「打开百度」   本地是「百度网盘」(name 0.72，模糊命中)，站点表把
+        #                 「百度」**确切**命中 → 开 baidu.com。用户说的是一个
+        #                 确切的站名，他要的是百度这个站，不是网盘。
+        #   「打开百度网盘」站点表里「百度网盘」也确切命中 → 但用户说的名字和
+        #                 **本机那个程序一模一样**，那当然开程序。
+        #   「打开微信」   站点表里没有微信，本地是 action 确切命中 → 开微信。
+        #   「打开百度官网」用户点明了要网页 → 无条件开网页。
+        app_is_exact = app is not None and app.how in ("exact", "action", "nickname")
+        web_wins = w is not None and (
+            wants_web or (w.confident and not app_is_exact)
+        )
+        if web_wins:
+            return Intent(
+                WEB, "open", verb="打开", url=w.url, url_name=w.name,
+                via_search=w.via_search, source=text, payload=obj, candidates=hits,
+                why=f"动词是打开，对象「{obj}」解析为网页：{w.why}"
+                + (
+                    f"；本机另有「{app.name}」（{app.how} {app.score:.2f}），但你说的是网站名"
+                    if app is not None and not app_is_exact
+                    else ""
+                ),
+            )
+
     if app is None:
         if not opens:
             return None  # 不是在要求打开什么，交给下游
@@ -463,10 +621,12 @@ __all__ = [
     "SCHEDULE",
     "SCHEDULE_NOUNS",
     "SCHEDULE_VERBS",
+    "WEB",
     "Intent",
     "ResolvedApp",
     "extract_title",
     "interpret",
     "resolve_app",
+    "resolve_web",
     "strip_verb",
 ]

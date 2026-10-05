@@ -116,10 +116,32 @@ def test_handler_requires_target(tmp_path: Path):
     body = """
 [[action]]
 id = "x"
-handler = "open_url"
-aliases = ["某个网站"]
+handler = "open_path"
+aliases = ["某个文件夹"]
 """
     with pytest.raises(ConfigError, match="必须提供 target"):
+        load_config(write_cfg(tmp_path, body))
+
+
+def test_open_url_may_omit_target(tmp_path: Path):
+    """open_url 允许 target 留空：地址可以由意图层在运行时给出。
+
+    `open.web` 那条就是这样——「打开百度」的网址来自站点表（voice_ctl/web.py），
+    写不到配置里。别的 handler 没有"运行时才知道目标"这回事，照旧要求写死。
+    """
+    body = """
+[[action]]
+id = "open.web"
+handler = "open_url"
+aliases = ["网页"]
+"""
+    cfg = load_config(write_cfg(tmp_path, body))
+    assert cfg.actions[0].target == ""
+
+
+def test_web_search_url_needs_the_placeholder(tmp_path: Path):
+    body = MINIMAL + '\n[web]\nsearch_url = "https://www.baidu.com/s"\n'
+    with pytest.raises(ConfigError, match=r"\{q\}"):
         load_config(write_cfg(tmp_path, body))
 
 

@@ -235,6 +235,33 @@ class ScheduleConfig:
 
 
 @dataclass
+class WebConfig:
+    """网页解析：「打开百度」→ baidu.com（见 voice_ctl/web.py）。
+
+    为什么单独一段而不是往动作表里塞几十条 `[[action]]`：动作表是**用户自己配
+    固定几个站**的地方（`target = "https://..."`），而这里是"说得出名字就该开得
+    出来"的那层兜底。两者互补，不重复。
+    """
+
+    enabled: bool = True
+    """关掉就退回旧行为：只有配置里写了 target 的站才开得了。"""
+
+    search_fallback: bool = True
+    """站点表里没有的名字，走一次搜索而不是直接失败。
+
+    默认开着，因为它把"什么都没发生"变成"至少给了你搜索结果"。代价是**联网**
+    ——搜索页要能上网。彻底离线用的话把它关掉：站点表本身不联网，关了之后
+    「打开百度」照样能用。"""
+
+    search_url: str = "https://www.baidu.com/s?wd={q}"
+    """搜索模板，`{q}` 会被替换成 URL 编码后的查询词。"""
+
+    def validate(self) -> None:
+        if self.search_fallback and "{q}" not in self.search_url:
+            raise ConfigError("web.search_url 里必须有 {q} 占位符，否则查询词没地方放")
+
+
+@dataclass
 class LLMConfig:
     """可选的小模型层：用本地跑着的大模型兜住前几层的长尾（见 voice_ctl/llm.py）。
 
@@ -349,7 +376,10 @@ class ActionConfig:
             )
         if not self.aliases and not self.describe and not self.target:
             raise ConfigError(f"动作 {self.id!r} 既没有 aliases 也没有 target，无法匹配")
-        if self.handler in ("open_path", "open_url", "shell", "sysctl") and not self.target:
+        # open_url 允许 target 留空：地址可以由意图层在运行时给出（`open.web`
+        # 那条就是——「打开百度」的网址来自站点表，见 voice_ctl/web.py）。
+        # 其它 handler 没有"运行时才知道目标"这回事，照旧要求写死。
+        if self.handler in ("open_path", "shell", "sysctl") and not self.target:
             raise ConfigError(f"动作 {self.id!r} 的 handler={self.handler} 必须提供 target")
 
 
@@ -368,6 +398,7 @@ class AppConfig:
     decision: DecisionConfig = field(default_factory=DecisionConfig)
     intent: IntentConfig = field(default_factory=IntentConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+    web: WebConfig = field(default_factory=WebConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     feedback: FeedbackConfig = field(default_factory=FeedbackConfig)
     actions: list[ActionConfig] = field(default_factory=list)
@@ -383,6 +414,7 @@ class AppConfig:
         self.decision.validate()
         self.intent.validate()
         self.schedule.validate()
+        self.web.validate()
         self.llm.validate()
 
         if not self.actions:
@@ -607,13 +639,13 @@ def load_config(path: str | Path | None = None) -> AppConfig:
 
     unknown_top = set(raw) - {
         "hotkey", "audio", "model", "normalize", "match", "decision", "intent", "schedule",
-        "llm", "feedback", "action"
+        "web", "llm", "feedback", "action"
     }
     if unknown_top:
         raise ConfigError(
             f"顶层有无法识别的段：{', '.join(sorted(unknown_top))}；"
             "可用：hotkey / audio / model / normalize / match / decision / intent / "
-            "schedule / llm / feedback / action"
+            "schedule / web / llm / feedback / action"
         )
 
     raw_actions = raw.get("action", [])
@@ -629,6 +661,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         decision=_build(DecisionConfig, _section(raw, "decision"), "decision"),
         intent=_build(IntentConfig, _section(raw, "intent"), "intent"),
         schedule=_build(ScheduleConfig, _section(raw, "schedule"), "schedule"),
+        web=_build(WebConfig, _section(raw, "web"), "web"),
         llm=_build(LLMConfig, _section(raw, "llm"), "llm"),
         feedback=_build(FeedbackConfig, _section(raw, "feedback"), "feedback"),
         actions=[

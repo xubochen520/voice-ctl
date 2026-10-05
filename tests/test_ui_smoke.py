@@ -431,6 +431,24 @@ def test_settings_rejects_invalid_timing(app, cfg_path: Path):  # noqa: ANN001
     assert app.cfg.hotkey.max_duration_ms == before
 
 
+def test_settings_web_toggles_round_trip(app, cfg_path: Path):  # noqa: ANN001
+    """网页那一组的开关要真的写进配置。
+
+    搜索兜底是**唯一会让语音指令联网**的开关，用户必须关得掉。
+    """
+    app.show_tab("settings")
+    pump(app, 6)
+    s = app.tabs["settings"]
+    s._web_on.set(False)
+    s._web_search.set(False)
+    s._save()
+    pump(app, 10)
+    assert app.cfg.web.enabled is False
+    assert app.cfg.web.search_fallback is False
+    text = cfg_path.read_text(encoding="utf-8")
+    assert "[web]" in text and "search_fallback = false" in text
+
+
 def test_number_row_two_way_sync(app):  # noqa: ANN001
     from voice_ctl.ui.tab_settings import NumberRow
 

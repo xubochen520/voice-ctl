@@ -51,6 +51,13 @@ _PUNCT = " \t\r\n,，。.!！?？、;；:：~～…\"'“”‘’「」『』()
 
 
 def strip_punct(text: str) -> str:
+    """去掉首尾的标点和空白。
+
+    ASCII 的 `,` `;` `:` 必须在内。归一化器**不会**动它们（它只收拾中文标点），
+    而 Windows 的语音输入和不少 ASR 输出给的就是半角逗号——实测
+    「打开百度网盘,呸」里那个逗号原来剥不掉，于是 `endswith("呸")` 之类按
+    整串做的判断全部落空。
+    """
     return text.strip(_PUNCT)
 
 
@@ -102,6 +109,142 @@ def ba_construction(text: str) -> tuple[str, str] | None:
 
 
 _PRONOUN_HEADS = ("我", "你", "您", "他", "她", "它", "咱", "咱们", "我们", "你们")
+
+
+# --------------------------------------------------------------------------- #
+# 自我更正 / 撤回
+# --------------------------------------------------------------------------- #
+
+CORRECTION_MARKERS = (
+    "呸呸呸", "我呸", "呸", "说错了", "我说错了", "说错", "讲错了", "口误",
+    "不对不对", "不对", "重说", "重新说", "当我没说",
+)
+"""用户说到一半自己撤回时的那几个词。
+
+「打开百度网盘，呸」是用户亲口给的用例：这里「呸」不是要打开的什么东西，
+而是**作废整句**。没有这一层，那句话会照常去开百度网盘——用户刚说完"不要"，
+程序却执行了，这是最伤信任的一类错误。
+
+分两个方向用（`detect_correction`）：
+  * 结尾出现 → 整句作废
+  * 中间出现 → 丢掉它前面的部分，用后面的（「打开百度，不对，打开淘宝」）
+
+**「算了」「取消」不在表里**，这是量过的：「打开微信，算了」的切分结果是
+`['打开微信', '算了']`，段数 > 1 而「不对」恰好不是最后一段的首词，于是整句
+被误作废——用户明明说了要开微信。这两个词在 `NO_WORDS` 里是对的（它们是对
+确认卡的回答），但当**整句的尾巴**讲没有这个意思。宁可少收回一次，
+也不要把正常指令吃掉。
+"""
+
+_CLAUSE_SEP = re.compile(r"[,，。.．;；:：!！?？~～、\s]+")
+r"""切停顿用的分隔符，写成一个显式字符类。
+
+**不要写成 `[,，。;；!！?？\s]+` 这种区间形式**：汉字在 Unicode 里是连续的，
+`；`(U+FF1B) 到 `？`(U+FF1F) 之间就夹着 `＜＝＞` 和一个变体选择符，`!`(U+0021)
+到 `！`(U+FF01) 之间更是横跨几千个码位——实测那样写会把几乎所有汉字都当成
+分隔符，「打开微信，算了」被切成 6 段。
+"""
+
+
+def _clauses(text: str) -> list[str]:
+    """按停顿把一句话切成小段。
+
+    只在**明确的停顿标点**上切。空格也算——实测「打开百度网盘 呸」里那个空格
+    就是用户用来分开「呸」的，而「打开 / 百度 / 网盘」这种把名字切碎的情况
+    不影响结果（切碎之后拿去查站点表查不到，就是查不到）。
+    """
+    return [c for c in _CLAUSE_SEP.split(strip_punct(text)) if c]
+
+
+def _starts_command(text: str) -> bool:
+    """这段文字看起来是不是一条新的命令（句首是开关动词）。"""
+    return any(text.startswith(v) for v in OPEN_VERBS + CLOSE_VERBS + FORCE_VERBS if len(v) > 1)
+
+
+def detect_correction(text: str) -> tuple[str, bool]:
+    """看这句话有没有被用户自己撤回。返回 (可用文本, 是否整句作废)。
+
+    从**最后一个**标记开始试着套两条规则：
+
+      A. 标记后面还有一条新命令（后面那段以开关动词开头，或者标记本身就占了一整
+         段）→ 用户改口了，丢掉标记及其之前的部分，用后面那条命令。
+         「打开百度，不对，打开淘宝」→「打开淘宝」
+         「打开百度不对打开淘宝」→「打开淘宝」（ASR 常常不给逗号，所以不能只看标点）
+      B. 标记在结尾、后面什么都没有 → 整句作废。
+         「打开百度网盘，呸」→ 不执行
+
+    两条都不成立就原样返回。这是刻意的保守：**宁可漏判成没撤回，也不要误伤**。
+    实测「提醒我不对账」里就夹着一个「不对」，它后面既没有新命令、也不在结尾，
+    所以整句照常处理——把这种句子作废掉，用户会觉得程序在乱猜。
+    """
+    s = strip_punct(text)
+    if not s:
+        return s, False
+
+    # 在**整句**里从右往左找标记，不是只在最后一段里找：「打开百度，不对，打开淘宝」
+    # 的标记在中间那一段，只扫最后一段就会把它漏掉。
+    hits: list[tuple[int, str]] = []
+    for m in CORRECTION_MARKERS:
+        start = 0
+        while (i := s.find(m, start)) >= 0:
+            hits.append((i, m))
+            start = i + 1
+    # 位置靠右的优先；同一位置取最长的标记（「说错了」要赢过「说错」）
+    hits.sort(key=lambda t: (t[0], len(t[1])), reverse=True)
+
+    for i, m in hits:
+        after = strip_punct(strip_trailing_glue(s[i + len(m):]))
+        before = strip_punct(s[:i])
+        at_clause_start = not before or _CLAUSE_SEP.fullmatch(before[-1]) is not None
+        if after:
+            # 改口要成立，后面必须**真的跟着一条新命令**：以开关动词开头
+            # （「打开百度不对打开淘宝」），或者标记本身独占一段
+            # （「打开百度，不对，打开淘宝」）。
+            #
+            # 只要求"后面还有字"是不够的——实测「说错了」会被拆成「说错」+残余的
+            # 「了」，那个「了」不是命令，却让整句变成一条叫「了」的新命令。
+            if _starts_command(after) or (at_clause_start and len(after) >= 2):
+                return after, False
+            continue
+        if before:
+            # 标记在结尾：整句作废。用户刚说过"呸/不对"，不该再执行它。
+            return "", True
+    # 整句就是一个标记（「呸」「不对」「说错了」）。这是用户在被听错之后最常见的
+    # 反应——上一次听岔了，于是这次只丢一个字出来。它必须走"作废"这条路，否则会
+    # 被当成一句看不懂的话，报告成「别名没命中」——那等于没接住用户的意图。
+    #
+    # 先剥尾巴再比、也比不剥的那份：「说错了」的尾巴「了」在 TRAILING_GLUE 里，
+    # 剥完只剩「说错」，而表里两条都写着，两种写法都要认。
+    if s in CORRECTION_MARKERS or strip_punct(strip_trailing_glue(s)) in CORRECTION_MARKERS:
+        return "", True
+    return s, False
+
+
+# --------------------------------------------------------------------------- #
+# 网页类线索词
+# --------------------------------------------------------------------------- #
+
+WEB_CATEGORY_WORDS = ("网页", "官网", "网站", "网址", "主页", "首页", "页面")
+"""「打开百度**网页**」里的类别词。
+
+它说明用户要的是**网站**而不是本地程序。剥掉它之后剩下的「百度」才是名字——
+不剥的话会拿「百度网页」当应用名去查索引，什么也查不到（实测就是这样），
+然后告诉用户"没找到叫「百度网页」的应用"，而用户明明只是想开个网页。
+
+「网」一个字不算：它是「淘宝网」「新浪网」「百度网盘」这些**名字本身**的一部分，
+剥掉就把名字弄坏了。
+"""
+
+
+def strip_web_cue(text: str) -> tuple[str, bool]:
+    """剥掉句尾的网页类别词。返回 (剩下的名字, 句尾有没有出现过类别词)。"""
+    s = strip_punct(text)
+    for w in sorted(WEB_CATEGORY_WORDS, key=len, reverse=True):
+        if s.endswith(w) and len(s) > len(w):
+            rest = strip_punct(s[: -len(w)])
+            if rest:
+                return rest, True
+    return s, False
 
 
 def is_negated(text: str) -> bool:
@@ -183,17 +326,21 @@ def parse_yes_no(text: str) -> bool | None:
 
 __all__ = [
     "CLOSE_VERBS",
+    "CORRECTION_MARKERS",
     "FORCE_VERBS",
     "NEGATIONS",
     "NO_WORDS",
     "OPEN_VERBS",
+    "WEB_CATEGORY_WORDS",
     "YES_WORDS",
     "ba_construction",
+    "detect_correction",
     "is_negated",
     "leading_verb",
     "parse_yes_no",
     "strip_leading_glue",
     "strip_punct",
     "strip_trailing_glue",
+    "strip_web_cue",
     "verb_kind",
 ]

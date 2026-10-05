@@ -69,6 +69,16 @@ model = "multilingual"     # 中文务必用 multilingual；english checkpoint �
 min_confidence = 0.6       # 低于此值不执行，只提示。实测负样本正好落在 0.589
 onnx_dir = "models/laya-onnx/multilingual"
 
+[web]
+# 网页解析：说「打开百度」就开 baidu.com（站点表在 voice_ctl/web.py，约 70 个常见站）。
+# 关掉就退回旧行为：只有配置里写了 target 的站才开得了。
+enabled = true
+# 站点表里没有的名字，退一步走搜索而不是直接失败。
+# 这需要**联网**（搜索页要能上网）。彻底离线用就设 false——站点表本身不联网，
+# 关了之后「打开百度」照样能用。
+search_fallback = true
+search_url = "https://www.baidu.com/s?wd={q}"
+
 [feedback]
 beep = true
 beep_start_hz = 880
@@ -209,6 +219,16 @@ handler = "open_url"
 aliases = ["浏览器", "打开浏览器", "上网", "chrome", "谷歌浏览器"]
 describe = "打开浏览器上网"
 target = "https://www.bing.com"
+
+# 打开任意网站：说「打开百度」「打开淘宝官网」就能开，网址由站点表/搜索解析。
+# target 留空是**故意的**——地址运行时才知道（见 voice_ctl/web.py）。
+# 想固定打开某一个站，写一条普通 open_url 就行（上面 open.browser 那样）。
+[[action]]
+id = "open.web"
+handler = "open_url"
+aliases = ["网页", "网站", "官网"]
+describe = "打开一个网站（说得出名字就能开）"
+target = ""
 
 [[action]]
 id = "open.explorer"

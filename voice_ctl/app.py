@@ -25,7 +25,8 @@ from .actions import ActionResult, ActionContext, Registry
 from .apps import AppEntry, AppIndex, process_hints
 from .asr import Asr, AsrError, AsrResult
 from .config import ActionConfig
-from .intent import APP, SCHEDULE, Intent, interpret
+from .intent import APP, SCHEDULE, WEB, Intent, interpret
+from . import lexicon
 from .matcher import Match, Matcher
 from .normalize import NormalizeConfig, Normalizer
 
@@ -36,6 +37,15 @@ CLOSE_ACTION_ID = "sys.close_window"
 """兜底的关闭动作：用户说要关的东西不在已安装应用里（「关闭记事本」而记事本
 没出现在开始菜单）。它按名字去关窗口，比"什么都不做"有用。"""
 
+WEB_ACTION_ID = "open.web"
+"""打开网页的动作 id。
+
+和 `open.url` 的区别：`open.url` 的地址写在配置里（用户自己固定几个站），
+`open.web` 的地址是**运行时解析出来的**（「打开百度」→ baidu.com），走
+`ctx.slots["url"]`。同一条 handler，只是来源不同——和 open.app / open.target
+那一对是一个道理。
+"""
+
 WEAK_MATCH = 0.85
 """意图层已经读懂、但解析不出对象时，还认不认别名匹配的结果。
 
@@ -43,6 +53,20 @@ WEAK_MATCH = 0.85
 会以 0.633 冒出来并**真的打开浏览器**。而达到 0.85 以上的匹配（比如
 `alias-hit` 完整命中别名）仍然是可信的，照旧执行。
 """
+
+COMPOUND_SEPS = ("并且", "然后再", "然后", "接着", "还有就是", "还有", "再打开", "顺便")
+"""把一句话拆成两件事的连接词。
+
+只有这几个。**「和」「跟」「以及」刻意不在里面**：它们出现在名字里的概率太高
+（「微博和腾讯视频」是两个站，但「哔哩哔哩和它的朋友们」是一个名字），
+拆错的代价是把一条正常指令劈成两条看不懂的片段。
+
+实测来源：日志里那句「打开浏览器并且打开百度页面」原来只执行前半句，后半句
+**没有任何提示地消失**——用户以为程序没听见，其实是听懂了但丢掉了。
+"""
+
+_JOIN_HINT = "和"
+"""并回上一截时用的连接词。选「和」是因为它不在 COMPOUND_SEPS 里，不会再次被拆。"""
 
 
 @dataclass
@@ -79,6 +103,11 @@ class Outcome:
     intent: Intent | None = None
     """意图层的判断结果。有它就能解释「为什么是关闭而不是打开」。"""
 
+    steps: list[tuple[str, str, str]] = field(default_factory=list)
+    """一句话里听出多件事时，每件事的 (说的什么, 动作, 结果)。
+
+    单件事时是空的——那时 `report` 的常规几行已经说清了。"""
+
     @property
     def ok(self) -> bool:
         return bool(self.result and self.result.ok)
@@ -91,6 +120,19 @@ class Outcome:
             lines.append(f"归一化: {self.normalized}")
         if self.asr:
             lines.append(f"ASR   : {self.asr.summary()}")
+
+        # 一句话里有多件事时，逐条列出来，**不再重复报第一条的命中/执行**——
+        # 上面逐条已经说清了，再报一遍会让日志长一倍，读起来还以为是两回事。
+        if self.steps:
+            lines.append(f"拆分  : 听出 {len(self.steps)} 件事 —— {self.note}")
+            for i, (piece, action, detail) in enumerate(self.steps, 1):
+                lines.append(f"  {i}. 「{piece}」")
+                lines.append(f"     {action or '（没命中）'} —— {detail}" if action
+                             else f"     {detail}")
+            if verbose:
+                lines.append(f"耗时  : {self.timing.summary()}")
+            return "\n".join(lines)
+
         if self.intent is not None and self.intent.why:
             lines.append(f"意图  : {self.intent.kind}/{self.intent.polarity} —— {self.intent.why}")
         if self.action_id:
@@ -123,6 +165,9 @@ class Pipeline:
         log=None,
         app_index: AppIndex | None = None,
         intent_enabled: bool = True,
+        web_index=None,
+        web_enabled: bool = True,
+        web_search: bool = True,
         llm=None,
         llm_candidates: int = 12,
         clock=None,
@@ -137,6 +182,10 @@ class Pipeline:
         self._log = log
         self.app_index = app_index
         self.intent_enabled = intent_enabled
+        self.web_index = web_index
+        """站点表（voice_ctl.web.WebIndex）。None = 用内置那份。"""
+        self.web_enabled = web_enabled
+        self.web_search = web_search
         self.llm = llm
         """可选的小模型层（voice_ctl.llm.SlotExtractor）。None = 没开。"""
         self.llm_candidates = llm_candidates
@@ -170,7 +219,9 @@ class Pipeline:
         timing.add("asr", (time.perf_counter() - t0) * 1000)
         return res
 
-    def understand(self, text: str, timing: StageTiming) -> tuple[Intent | None, Match | None, str, str]:
+    def understand(
+        self, text: str, timing: StageTiming, *, intent_enabled: bool | None = None
+    ) -> tuple[Intent | None, Match | None, str, str]:
         """意图层 → 别名匹配 → 语义层。返回 (意图, 匹配, 途径, 说明)。
 
         语义层只在前两层都没结果时才**会被调用**——它加载 10 秒、推理 40-100ms，
@@ -179,11 +230,14 @@ class Pipeline:
         t0 = time.perf_counter()
         norm = self.norm.normalize(text)
         intent: Intent | None = None
-        if self.intent_enabled:
+        enabled = self.intent_enabled if intent_enabled is None else intent_enabled
+        if enabled:
             try:
                 intent = interpret(
                     text, index=self.app_index, actions=self.actions,
                     normalizer=self.norm, now=self.now,
+                    web_index=self.web_index, web_enabled=self.web_enabled,
+                    web_search=self.web_search,
                 )
             except Exception as e:  # noqa: BLE001 - 意图层出错不该让助手失能
                 intent = None
@@ -195,6 +249,10 @@ class Pipeline:
             if intent.kind == SCHEDULE and "schedule" in self.registry:
                 return intent, _match_from_intent(intent, norm, text, "schedule"), "intent", ""
             if intent.kind == APP and intent.app is not None:
+                aid = self.action_for(intent)
+                if aid is not None:
+                    return intent, _match_from_intent(intent, norm, text, aid), "intent", ""
+            if intent.kind == WEB:
                 aid = self.action_for(intent)
                 if aid is not None:
                     return intent, _match_from_intent(intent, norm, text, aid), "intent", ""
@@ -280,11 +338,15 @@ class Pipeline:
         return "别名没命中，且语义层未启用"
 
     def action_for(self, intent: Intent) -> str | None:
-        """一个应用意图该落到哪个动作 id。
+        """一个意图该落到哪个动作 id。
 
         配置里写过这条动作就用它——用户亲手配的 target/args 必须算数，
         不能因为应用索引也认得这个名字就改走别的路。
         """
+        if intent.kind == WEB:
+            # 网页只认 open.url。注册表里没有它就退回别名匹配——
+            # 用户把这条动作删了是他的选择，不该被"帮"着执行别的动作。
+            return WEB_ACTION_ID if WEB_ACTION_ID in self.registry else None
         app = intent.app
         if app is None:
             return None
@@ -301,14 +363,20 @@ class Pipeline:
     def slots_for(self, intent: Intent, match: Match) -> dict[str, Any]:
         """把意图翻译成动作槽位。
 
-        日程走 `when`/`title`，开关应用走 `app`/`exe_names`——两种动作读的键不一样，
-        所以按意图类型分开填，而不是硬塞进同一套名字里。
+        日程走 `when`/`title`，开关应用走 `app`/`exe_names`，网页走 `url`——
+        三种动作读的键不一样，所以按意图类型分开填，而不是硬塞进同一套名字里。
         """
         if intent.kind == SCHEDULE:
             out: dict[str, Any] = {"title": intent.title, "source": intent.source}
             if intent.when is not None:
                 out["when"] = intent.when
             return out
+        if intent.kind == WEB:
+            return {
+                "url": intent.url,
+                "url_name": intent.url_name,
+                "via_search": intent.via_search,
+            }
         if intent.kind == APP and intent.app is not None:
             return {
                 "app": intent.app,
@@ -359,21 +427,106 @@ class Pipeline:
     # -- 端到端 ----------------------------------------------------------- #
 
     def process_text(self, text: str, *, dry_run: bool = False) -> Outcome:
-        """只跑「文本 → 动作」，用于 simulate / 测试。"""
+        """只跑「文本 → 动作」，用于 simulate / 测试。
+
+        一句里说了两件事时会拆成两条分别执行（`split_commands`）——实测
+        「打开浏览器并且打开百度页面」原来只执行前半句，后半句**没有任何提示地
+        消失**，用户以为程序没听见。
+        """
         timing = StageTiming()
         out = Outcome(text=text, normalized=self.norm.normalize(text), timing=timing)
         if not out.normalized:
             out.note = "输入为空"
             return out
 
-        intent, match, via, note = self.understand(text, timing)
+        parts = split_commands(out.normalized)
+        if len(parts) > 1:
+            self._run_each(parts, out, dry_run=dry_run)
+            return out
+
+        self._run_one(text, out, dry_run=dry_run, intent_enabled=self.intent_enabled)
+        return out
+
+    def _run_each(self, parts: list[str], out: Outcome, *, dry_run: bool) -> None:
+        """把拆出来的几条依次执行，结果合并到同一个 Outcome 里。
+
+        每条都在 intent/匹配之前**再验一遍**能不能读懂，读不懂就并回上一条
+        （见 `split_commands` 的说明）——判定要用和真正执行时完全一样的那套
+        逻辑，否则会出现"拆是拆开了，但那条根本执行不了"。
+        """
+        done: list[Outcome] = []
+        pending = list(parts)
+        while pending:
+            piece = pending.pop(0)
+            probe = Outcome(text=piece, normalized=piece, timing=StageTiming())
+            self._run_one(piece, probe, dry_run=dry_run, intent_enabled=self.intent_enabled)
+            if probe.action_id is None and probe.result is None and pending:
+                # 这一截自己不是一条命令，多半是上一句还没说完（「打开记事本
+                # 和计算器」里的「计算器」）。并回去重试。
+                pending[0] = f"{piece}{_JOIN_HINT}{pending[0]}"
+                continue
+            done.append(probe)
+
+        # 意图与命中取第一条（报告顶部那几行要有东西），执行结果列全
+        first = done[0]
+        out.intent, out.match, out.via = first.intent, first.match, first.via
+        ok = [o for o in done if o.ok]
+        bad = [o for o in done if not o.ok]
+        if ok:
+            out.action_id = ok[0].action_id
+        elif bad:
+            out.action_id = bad[0].action_id
+
+        # 每一条的结果都留在报告里。只报第一条是不行的——用户说了两件事，
+        # 报告里却只有一件，第二件是成是败他看不出来。`steps` 就是给报告看的。
+        out.steps = [
+            (o.text, o.action_id or "", o.result.describe() if o.result else (o.note or "没读懂"))
+            for o in done
+        ]
+        out.note = f"这句话里听出 {len(done)} 件事" + (
+            f"，{len(bad)} 件没做成" if bad else "，都做完了"
+        )
+        # 合成一个总结果：任何一步失败，这次就算部分失败——不能让用户以为全成了
+        if bad and ok:
+            out.result = ActionResult(
+                False,
+                f"{len(ok)} 件成功，{len(bad)} 件没做成",
+                "；".join(f"{t}：{d}" for t, _, d in out.steps),
+            )
+        elif bad:
+            out.result = ActionResult(
+                False, "都没做成", "；".join(f"{t}：{d}" for t, _, d in out.steps)
+            )
+        else:
+            out.result = ActionResult(
+                True,
+                "、".join(o.result.message for o in done if o.result),
+                "；".join(f"{t}：{d}" for t, _, d in out.steps),
+            )
+        for o in done:
+            if o.timing.values:
+                for k, v in o.timing.values.items():
+                    out.timing.add(k, v)
+
+    def _run_one(
+        self, text: str, out: Outcome, *, dry_run: bool, intent_enabled: bool | None = None
+    ) -> None:
+        """一条命令的完整链路：意图层 → 别名匹配 → 语义层 → 执行。
+
+        `intent_enabled` 是按**这一次调用**传的，不去改 `self.intent_enabled`：
+        后者是共享状态，而拆句会连着跑好几条，中途改共享状态等于给自己埋并发坑。
+        """
+        timing = out.timing
+        intent, match, via, note = self.understand(
+            text, timing, intent_enabled=intent_enabled
+        )
         out.intent, out.match, out.via, out.note = intent, match, via, note
 
         if intent is not None and intent.kind == "none":
             out.via = "intent"
             out.note = intent.why or "这句话不是在要求执行什么"
             if intent.polarity == "negate":
-                return out
+                return
             # 解析不出对象（「打开QQ音乐」而没装）：别名匹配也过一遍。
             # 用户可能写过一条 [[action]] 用别的名字绑定了它。
             #
@@ -383,28 +536,27 @@ class Pipeline:
             # 「没找到叫QQ音乐的应用」，不是"已打开浏览器"。
             m = self.matcher.best(out.normalized)
             if m is None or not m.action_id or m.action_id not in self.registry:
-                return out
+                return
             if m.score < WEAK_MATCH:
                 out.note += f"（别名匹配最接近的是 {m.action_id}，{m.score:.2f}，太弱没执行）"
-                return out
+                return
             match = m
             match.raw_input = text
             out.match = match
 
         if match is None:
-            return out
+            return
         if not match.action_id:
             out.note = "意图层读懂了这句话，但没有能执行它的动作"
-            return out
+            return
 
         if match.action_id not in self.registry:
             out.note = f"匹配到 {match.action_id}，但注册表里没有它"
-            return out
+            return
         out.action_id = match.action_id
         out.result = self.execute(
             match.action_id, match, timing, dry_run=dry_run, intent=intent
         )
-        return out
 
     def process_audio(self, samples, *, dry_run: bool = False, sample_rate: int = 16000) -> Outcome:
         """完整链路：波形 → 动作。"""
@@ -425,6 +577,54 @@ class Pipeline:
         return out
 
 
+def split_commands(text: str) -> list[str]:
+    """一句话里说了几件事就切几段。只有一段时原样返回。
+
+    刻意做得**很保守**：只按少数几个明确的连接词切（见 COMPOUND_SEPS），
+    切完还要每一段都像一条命令（以开关动词开头）才认。理由是这个函数的失败
+    方式不对称——
+
+      * 少切一刀：后半句没执行，但前面那句是对的，用户至少看到了部分效果；
+      * 多切一刀：把一条正常指令劈成两条读不懂的片段，**两件事都做不成**。
+
+    所以宁可少切。「打开记事本和计算器」这种（连接词不在表里 + 后半段不像命令）
+    会原样返回，交给下游按一条处理，行为和以前一致。
+    """
+    s = text.strip()
+    if not s:
+        return []
+    pieces = [s]
+    for sep in sorted(COMPOUND_SEPS, key=len, reverse=True):
+        grown: list[str] = []
+        for p in pieces:
+            grown.extend(p.split(sep))
+        pieces = grown
+    parts = [lexicon.strip_punct(p) for p in pieces]
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        return [s]
+    # 第二段起必须像一条独立命令，否则整句不拆
+    for p in parts[1:]:
+        if not any(p.startswith(v) for v in _COMMAND_HEADS):
+            return [s]
+    return parts
+
+
+_COMMAND_HEADS = tuple(
+    sorted(
+        {
+            *(v for v in lexicon.OPEN_VERBS if len(v) > 1),
+            *(v for v in lexicon.CLOSE_VERBS if len(v) > 1),
+            *lexicon.FORCE_VERBS,
+            "提醒我", "叫我", "安排", "设个", "设置", "记一下",
+        },
+        key=len,
+        reverse=True,
+    )
+)
+"""一段话"像不像命令"的判据：句首是不是开关/日程动词。"""
+
+
 def _match_from_intent(intent: Intent, norm: str, text: str, action_id: str) -> Match:
     """把意图包装成 Match，让下游（日志、执行、统计）走同一条路。
 
@@ -432,6 +632,8 @@ def _match_from_intent(intent: Intent, norm: str, text: str, action_id: str) -> 
     意图层判的、还是别名匹配判的。
     """
     alias = intent.app.name if intent.app is not None else (intent.title or "(日程)")
+    if intent.kind == WEB:
+        alias = intent.url_name or intent.url
     return Match(
         action_id, 1.0, alias, f"intent:{intent.polarity}",
         normalized_input=norm, raw_input=text,
