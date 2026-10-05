@@ -101,6 +101,15 @@ VERSIONS = [
             "full": ROOT / "dist-full" / "voice-ctl.exe",
         },
     ),
+    (
+        "v0.3.3",
+        "voice-ctl 0.3.3 —— 打开网站、说错能收回、一句话两件事",
+        "docs/RELEASE-NOTES-0.3.3.md",
+        {
+            "lite": ROOT / "dist" / "voice-ctl.exe",
+            "full": ROOT / "dist-full" / "voice-ctl.exe",
+        },
+    ),
 ]
 
 
