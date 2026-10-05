@@ -17,6 +17,8 @@ build/
 build-full/
 dist/
 dist-full/
+dist-new/
+dist-full-new/
 *.pdb
 
 # 生成物：测试音频、基准明细
