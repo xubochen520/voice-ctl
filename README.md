@@ -13,6 +13,28 @@
 
 ## 快速开始
 
+### 方式一：下载 exe（无需 Python）
+
+到 [Releases](https://github.com/xubochen520/voice-ctl/releases) 下 `voice-ctl-*-win64-lite.exe`：
+
+```powershell
+.\voice-ctl-0.1.0-win64-lite.exe download   # 首次：下识别模型（226MB）
+.\voice-ctl-0.1.0-win64-lite.exe --selftest # 自检：确认依赖/模型/麦克风都正常
+.\voice-ctl-0.1.0-win64-lite.exe            # 直接跑，按住 Ctrl+Alt+Space 说话
+```
+
+首次运行会在 exe 旁边生成 `config.toml`，改热键、加动作都改它。
+
+| 变体 | 体积 | 首次使用 | 启动 |
+|---|---|---|---|
+| **lite** | 54.9 MB | 需跑一次 `download` | **1.6s** |
+| full | 206.9 MB | 开箱即用 | 3.0s（每次解包模型） |
+
+**推荐 lite**——多下一次模型，但每次启动快一倍。
+打包细节见 [docs/BUILDING-EXE.md](docs/BUILDING-EXE.md)。
+
+### 方式二：从源码
+
 ```powershell
 # 1. 建虚拟环境并装依赖
 python -m venv .venv

@@ -8,6 +8,12 @@ __pycache__/
 # 模型权重（226MB，用 `voice-ctl download` 拉取，不进版本库）
 models/
 
+# 打包产物（构建脚本重新生成，不进版本库）
+build/
+dist/
+dist-full/
+*.pdb
+
 # 生成物：测试音频、基准明细
 assets/tts/
 assets/*.wav

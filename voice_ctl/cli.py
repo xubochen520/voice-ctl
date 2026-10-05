@@ -59,6 +59,13 @@ class Runtime:
         )
 
 
+def model_dir_for(cfg: AppConfig) -> Path:
+    """模型目录，含「打包内嵌模型」兜底。所有命令都该用它，而不是 cfg.model_path()。"""
+    from . import bootstrap
+
+    return bootstrap.resolve_model_dir(cfg.model_path())
+
+
 def build_runtime(cfg: AppConfig, *, with_asr: bool = True, with_decision: bool | None = None) -> Runtime:
     norm = Normalizer(
         NormalizeConfig(
@@ -72,7 +79,7 @@ def build_runtime(cfg: AppConfig, *, with_asr: bool = True, with_decision: bool 
     matcher = Matcher(cfg.enabled_actions, normalizer=norm, threshold=cfg.match.threshold)
     registry = build_registry(cfg.enabled_actions)
     asr = Asr(
-        cfg.model_path(),
+        model_dir_for(cfg),
         language=cfg.model.language,
         use_itn=cfg.model.use_itn,
         num_threads=cfg.model.num_threads,
@@ -102,9 +109,11 @@ def build_runtime(cfg: AppConfig, *, with_asr: bool = True, with_decision: bool 
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
+    from . import bootstrap
+
     print(f"voice-ctl {__version__}")
-    print(f"Python   : {sys.version.split()[0]} ({sys.executable})")
-    print(f"平台     : {sys.platform}")
+    print(f"Python   : {sys.version.split()[0]}")
+    print(bootstrap.describe())
 
     print("\n--- 配置文件 ---")
     try:
@@ -112,11 +121,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except ConfigError as e:
         print(f"✗ 配置有问题：{e}")
         return 2
-    print(f"✓ 已加载 {cfg.source}")
+    if cfg.source is None:
+        print("· 没找到配置文件，使用的是**内置默认动作表**")
+        print("  想自定义就复制一份 config.toml 到程序同级目录，或用 --config 指定")
+    else:
+        print(f"✓ 已加载 {cfg.source}")
     print(cfg.describe())
 
     print("\n--- 模型 ---")
-    mp = cfg.model_path()
+    mp = model_dir_for(cfg)
     model = mp / "model.int8.onnx"
     tokens = mp / "tokens.txt"
     if model.is_file() and tokens.is_file():
@@ -230,11 +243,13 @@ def cmd_devices(args: argparse.Namespace) -> int:  # noqa: ARG001
 def cmd_download(args: argparse.Namespace) -> int:
     import urllib.request
 
+    from . import bootstrap
+
     try:
         cfg = load_config(args.config)
-        target = cfg.model_path()
+        target = model_dir_for(cfg)
     except ConfigError:
-        target = Path(args.dir or "models/sense-voice-int8").resolve()
+        target = Path(args.dir).resolve() if args.dir else bootstrap.default_model_dir()
 
     target.mkdir(parents=True, exist_ok=True)
     print(f"下载 SenseVoice int8 到 {target}")
@@ -324,7 +339,7 @@ def cmd_test(args: argparse.Namespace) -> int:
         print(f"✗ {e}")
         return 2
 
-    mp = cfg.model_path()
+    mp = model_dir_for(cfg)
     wavs = sorted((mp / "test_wavs").glob("*.wav"))
     if not wavs:
         print(f"✗ {mp / 'test_wavs'} 里没有样例音频；跑 `voice-ctl download`")
@@ -678,13 +693,10 @@ def _say(*args: object, **kw: object) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    # Windows 控制台默认不是 UTF-8，中文识别结果会变乱码
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", line_buffering=True)  # type: ignore[union-attr]
-        except Exception:  # noqa: BLE001
-            pass
-    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    # 编码与缓冲：必须在任何中文输出之前。见 bootstrap.setup_console 的说明。
+    from .bootstrap import setup_console
+
+    setup_console()
 
     parser = build_parser()
     args = parser.parse_args(argv)

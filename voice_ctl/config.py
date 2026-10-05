@@ -291,6 +291,36 @@ class AppConfig:
 # --------------------------------------------------------------------------- #
 
 
+def _builtin_actions() -> list[ActionConfig]:
+    """内置动作兜底。
+
+    正常情况下动作来自 config.toml；但打包成 exe 后用户可能把配置文件删了或改坏了，
+    此时**不该让程序直接不可用**——给一份够用的默认集，让 doctor 能提示他去恢复配置。
+
+    与仓库里 config.toml 的动作集保持一致（那份是权威，这里是安全网）。
+    """
+    raw: list[tuple[str, str, list[str], str, str]] = [
+        ("open.wechat", "open_app", ["微信", "威信", "wechat", "聊天", "发消息"], "打开微信聊天发消息", ""),
+        ("open.browser", "open_url", ["浏览器", "打开浏览器", "上网", "chrome"], "打开浏览器上网", "https://www.bing.com"),
+        ("open.explorer", "sysctl", ["文件夹", "资源管理器", "我的电脑"], "打开文件资源管理器", "explorer"),
+        ("open.notepad", "open_app", ["记事本", "notepad", "笔记本", "记录"], "打开记事本写字", "notepad.exe"),
+        ("open.calc", "open_app", ["计算器", "calc", "算一下"], "打开计算器", "calc.exe"),
+        ("open.terminal", "open_app", ["终端", "命令行", "cmd", "控制台"], "打开终端命令行", "wt.exe"),
+        ("open.taskmgr", "open_app", ["任务管理器", "进程管理"], "打开任务管理器", "taskmgr.exe"),
+        ("open.settings", "open_url", ["设置", "系统设置"], "打开系统设置", "ms-settings:"),
+        ("sys.volume_up", "sysctl", ["音量加", "声音大点", "大声点", "音量大"], "调高系统音量", "volume_up"),
+        ("sys.volume_down", "sysctl", ["音量减", "声音小点", "小声点", "音量小"], "调低系统音量", "volume_down"),
+        ("sys.mute", "sysctl", ["静音", "别出声", "关声音"], "系统静音或取消静音", "mute"),
+        ("sys.lock", "sysctl", ["锁屏", "锁定电脑"], "锁定电脑屏幕", "lock"),
+        ("sys.screenshot", "sysctl", ["截屏", "截图", "屏幕截图"], "截取整个屏幕", "screenshot"),
+        ("sys.show_desktop", "sysctl", ["显示桌面", "回到桌面"], "最小化所有窗口显示桌面", "show_desktop"),
+    ]
+    return [
+        ActionConfig(id=i, handler=h, aliases=a, describe=d, target=t)
+        for i, h, a, d, t in raw
+    ]
+
+
 def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
     v = raw.get(name, {})
     if not isinstance(v, dict):
@@ -386,16 +416,22 @@ def _build(cls, data: dict[str, Any], section: str):
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:
-    """加载配置。path 为空时依次找 ./config.toml、~/.voice-ctl/config.toml。"""
+    """加载配置。
+
+    path 为空时用 bootstrap.resolve_config() 定位：
+        --config 显式指定 > 可写数据目录（用户改过的那份）> 打包内模板 > cwd
+    都找不到时**回落到内置默认值**而不是报错——打包成 exe 后用户机器上
+    本来就没有配置文件，此时应当能直接跑起来。
+    """
     if path is None:
-        for cand in (Path.cwd() / "config.toml", Path.home() / ".voice-ctl" / "config.toml"):
-            if cand.is_file():
-                path = cand
-                break
-        else:
-            raise ConfigError(
-                "找不到配置文件。请用 --config 指定，或在当前目录放一份 config.toml"
-            )
+        from .bootstrap import resolve_config
+
+        found = resolve_config(None)
+        if found is None:
+            cfg = AppConfig(actions=_builtin_actions())
+            cfg.validate()
+            return cfg
+        path = found
 
     p = Path(path).expanduser().resolve()
     if not p.is_file():
