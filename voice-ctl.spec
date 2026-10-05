@@ -61,10 +61,34 @@ hiddenimports = [
     "voice_ctl",
     "voice_ctl.actions",
     "voice_ctl.bootstrap",
+    "voice_ctl.events",
+    "voice_ctl.fetch",
+    "voice_ctl.confedit",
+    "voice_ctl.toml_edit",
+    "voice_ctl.runner",
+    "voice_ctl.ui",
+    "voice_ctl.ui.window",
+    "voice_ctl.ui.theme",
+    "voice_ctl.ui.widgets",
+    "voice_ctl.ui.tab_run",
+    "voice_ctl.ui.tab_logs",
+    "voice_ctl.ui.tab_hotkey",
+    "voice_ctl.ui.tab_actions",
+    "voice_ctl.ui.tab_settings",
+    "voice_ctl.ui.tab_about",
     "pynput.keyboard._win32",
     "pynput.mouse._win32",
     "sounddevice",
     "_sounddevice_data",
+    # 图形界面：tkinter 的 tcl/tk 数据目录由 PyInstaller 自带的 hook 收集，
+    # 但它只认得到"被 import 过"的模块。界面是延迟 import 的（cli 里才 import
+    # voice_ctl.ui），静态分析扫不到，必须显式声明。
+    "tkinter",
+    "tkinter.filedialog",
+    "tkinter.messagebox",
+    "tkinter.font",
+    "tkinter.ttk",
+    "tkinter.constants",
 ]
 
 # 可选依赖：装了才带上，没装不影响
@@ -84,7 +108,10 @@ excludes = [
     "laya.evals", "laya.calibrate", "laya.shortlist",
     # 科学计算与绘图的大件
     "matplotlib", "scipy", "pandas", "IPython", "notebook",
-    "tkinter", "PyQt5", "PyQt6", "PySide2", "PySide6", "wx",
+    # 图形界面用的是标准库自带的 tkinter（见下），这些第三方 GUI 一律不要。
+    # 注意：tkinter 本身**不能**排除——0.2.0 起界面是主要入口。
+    "PyQt5", "PyQt6", "PySide2", "PySide6", "wx",
+    "tkinter.test", "tkinter.tix", "tkinter.dnd",
     # 测试与开发工具
     "pytest", "setuptools", "pip", "wheel",
 ]

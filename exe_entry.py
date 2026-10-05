@@ -42,15 +42,18 @@ def _msgbox(title: str, text: str) -> None:
 HELP_TEXT = """voice-ctl —— 按住快捷键说话，本地离线识别后执行动作
 
 用法：
-  voice-ctl.exe                 直接常驻运行（按住 Ctrl+Alt+Space 说话）
-  voice-ctl.exe doctor          体检：模型/配置/动作/麦克风逐项检查
-  voice-ctl.exe download        下载识别模型（首次必做，约 226MB）
-  voice-ctl.exe test            用自带样例音频验证识别
+  voice-ctl.exe                  打开图形界面（日志 / 快捷键 / 功能 / 设置）
+  voice-ctl.exe ui               同上，显式写法
+  voice-ctl.exe run              不开界面，常驻监听热键（适合开机自启）
+  voice-ctl.exe doctor           体检：模型/配置/动作/麦克风逐项检查
+  voice-ctl.exe download         下载识别模型（首次必做，约 226MB）
+  voice-ctl.exe test             用自带样例音频验证识别
   voice-ctl.exe simulate 打开微信   不开麦克风，直接测匹配
-  voice-ctl.exe devices         列出麦克风
-  voice-ctl.exe --help          完整帮助
+  voice-ctl.exe devices          列出麦克风
+  voice-ctl.exe --selftest       打包自检（不碰麦克风与热键）
+  voice-ctl.exe --help           完整帮助
 
-首次使用建议顺序：download → doctor → run
+首次使用建议顺序：双击打开界面 → 在「设置」页下载模型 → 在「运行」页点启动
 """
 
 
@@ -77,17 +80,43 @@ def _selftest() -> int:
         ("sherpa_onnx", "语音识别（含原生 DLL）"),
         ("sounddevice", "录音（含 PortAudio DLL）"),
         ("pynput", "全局热键"),
+        ("tkinter", "图形界面"),
         ("pypinyin", "中文同音纠错（可选）"),
     ):
         try:
             m = __import__(mod)
-            ver = getattr(m, "__version__", "")
+            ver = f"Tk {m.TkVersion}" if mod == "tkinter" else getattr(m, "__version__", "")
             say(f"  ✓ {mod:14} {ver:12} {why}")
         except Exception as e:  # noqa: BLE001
             tag = "可选" if mod == "pypinyin" else "必需"
             say(f"  ✗ {mod:14} [{tag}] {why} -> {type(e).__name__}: {e}")
             if mod != "pypinyin":
                 ok = False
+
+    say("\n--- 图形界面（真正建一次窗口）---")
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+
+        from voice_ctl.ui import theme
+
+        theme.enable_dpi_awareness()
+        root = tk.Tk()
+        root.withdraw()
+        theme.init(root)  # 字体与全部 ttk 样式都在这里配，配置错了这里就会炸
+        ttk.Button(root, text="x", style="Primary.TButton").pack()
+        ttk.Entry(root).pack()
+        ttk.Combobox(root, values=["a"]).pack()
+        ttk.Treeview(root, columns=["a"]).pack()
+        root.update_idletasks()
+        say(f"  ✓ 窗口与 ttk 样式就绪（缩放 {theme.SCALE:.2f}×，字体 {theme.FONTS['body'][0]}）")
+        if not theme.apply_dark_titlebar(root):
+            say("  · 深色标题栏没设上（只影响观感）")
+        root.destroy()
+    except Exception as e:  # noqa: BLE001
+        say(f"  ✗ 图形界面建不起来: {type(e).__name__}: {e}")
+        say("    命令行功能不受影响（run / doctor / simulate 都还能用）")
+        ok = False
 
     say("\n--- 识别器构造（真正加载 ONNX 图）---")
     try:
@@ -179,22 +208,10 @@ def main() -> int:
 
     argv = sys.argv[1:]
 
-    # 无参数：双击场景给对话框，命令行场景直接进入常驻运行
+    # 无参数 = 双击场景。打开图形界面，而不是进去之后只有一个黑框在等热键：
+    # 用户双击一个 exe，期待的是"看到东西"；要常驻监听请显式用 `run`。
     if not argv:
-        if _has_console():
-            print(HELP_TEXT)
-            print("没有参数——3 秒后自动进入常驻运行（按住 Ctrl+Alt+Space 说话）")
-            print("按 Ctrl+C 退出。")
-            import time
-
-            try:
-                time.sleep(3)
-            except KeyboardInterrupt:
-                return 0
-            argv = ["run"]
-        else:
-            _msgbox("voice-ctl", HELP_TEXT)
-            return 0
+        argv = ["ui"]
 
     if argv[0] in ("--help", "-h"):
         print(HELP_TEXT)

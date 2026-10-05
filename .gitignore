@@ -20,3 +20,14 @@ assets/*.wav
 scripts/bench_e2e.json
 scripts/probe_asr.out.txt
 scripts/_tts_one.ps1
+
+# 运行日志（用户机器上生成，随时可删）
+voice-ctl.log
+voice-ctl.log.1
+config.toml.bak
+
+# 界面截图/冒烟脚本的临时产物
+_ui_*.png
+_ui_*.bmp
+_screen_*.png
+_shotcfg/

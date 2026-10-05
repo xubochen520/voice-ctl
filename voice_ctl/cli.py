@@ -8,18 +8,21 @@ import sys
 import threading
 import time
 import wave
-from dataclasses import dataclass
 from pathlib import Path
 
 from . import __version__
-from .actions import build_registry
-from .app import Pipeline
-from .asr import Asr, AsrError
+from .asr import AsrError
 from .config import AppConfig, ConfigError, load_config
-from .matcher import Matcher
-from .normalize import NormalizeConfig, Normalizer
 from .recorder import Recorder, RecorderError, list_input_devices, play_beep
-from .session import SessionController
+from .runner import Engine, Runtime, build_runtime, model_dir_for
+
+__all__ = [
+    "Runtime",
+    "build_parser",
+    "build_runtime",
+    "main",
+    "model_dir_for",
+]
 
 HF_BASE = (
     "https://huggingface.co/csukuangfj/"
@@ -32,75 +35,15 @@ MODEL_FILES = [
     ("test_wavs/en.wav", 0.22),
 ]
 
+# Runtime / build_runtime / model_dir_for 现在住在 runner.py —— UI 也要用它们，
+# 放在命令行模块里会让 UI 反向依赖 CLI。这里 re-export 只为兼容老写法。
+
 
 # --------------------------------------------------------------------------- #
 # 组装运行时
 # --------------------------------------------------------------------------- #
 
-
-@dataclass
-class Runtime:
-    cfg: AppConfig
-    normalizer: Normalizer
-    matcher: Matcher
-    registry: object
-    asr: Asr
-    decider: object | None = None
-
-    def pipeline(self) -> Pipeline:
-        return Pipeline(
-            asr=self.asr,
-            matcher=self.matcher,
-            registry=self.registry,  # type: ignore[arg-type]
-            actions=self.cfg.enabled_actions,
-            normalizer=self.normalizer,
-            decider=self.decider,
-            min_confidence=self.cfg.decision.min_confidence,
-        )
-
-
-def model_dir_for(cfg: AppConfig) -> Path:
-    """模型目录，含「打包内嵌模型」兜底。所有命令都该用它，而不是 cfg.model_path()。"""
-    from . import bootstrap
-
-    return bootstrap.resolve_model_dir(cfg.model_path())
-
-
-def build_runtime(cfg: AppConfig, *, with_asr: bool = True, with_decision: bool | None = None) -> Runtime:
-    norm = Normalizer(
-        NormalizeConfig(
-            strip_prefixes=cfg.match.strip_prefixes,
-            strip_suffixes=cfg.match.strip_suffixes,
-            inline_fillers=cfg.match.inline_fillers,
-            substitutions=cfg.normalize.substitutions,
-            use_pinyin=cfg.normalize.use_pinyin,
-        )
-    )
-    matcher = Matcher(cfg.enabled_actions, normalizer=norm, threshold=cfg.match.threshold)
-    registry = build_registry(cfg.enabled_actions)
-    asr = Asr(
-        model_dir_for(cfg),
-        language=cfg.model.language,
-        use_itn=cfg.model.use_itn,
-        num_threads=cfg.model.num_threads,
-        provider=cfg.model.provider,
-    )
-
-    decider = None
-    want = cfg.decision.enabled if with_decision is None else with_decision
-    if want:
-        from .decision import DecisionUnavailable, SemanticDecider
-
-        try:
-            decider = SemanticDecider(
-                cfg.enabled_actions, cfg.decision, root=cfg.decision_path()
-            )
-            decider.load()
-        except DecisionUnavailable as e:
-            print(f"⚠ 语义层启用失败，已回落到仅别名匹配：{e}", file=sys.stderr)
-            decider = None
-
-    return Runtime(cfg, norm, matcher, registry, asr, decider)
+# 具体实现在 runner.py（UI 与 CLI 共用）。这里只留一个兼容层说明。
 
 
 # --------------------------------------------------------------------------- #
@@ -114,6 +57,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"voice-ctl {__version__}")
     print(f"Python   : {sys.version.split()[0]}")
     print(bootstrap.describe())
+    print(f"运行日志  : {bootstrap.log_path()}")
 
     print("\n--- 配置文件 ---")
     try:
@@ -241,9 +185,8 @@ def cmd_devices(args: argparse.Namespace) -> int:  # noqa: ARG001
 
 
 def cmd_download(args: argparse.Namespace) -> int:
-    import urllib.request
-
     from . import bootstrap
+    from .fetch import download_asr_model
 
     try:
         cfg = load_config(args.config)
@@ -251,36 +194,8 @@ def cmd_download(args: argparse.Namespace) -> int:
     except ConfigError:
         target = Path(args.dir).resolve() if args.dir else bootstrap.default_model_dir()
 
-    target.mkdir(parents=True, exist_ok=True)
-    print(f"下载 SenseVoice int8 到 {target}")
-    print("（来自 HuggingFace csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09）")
-
-    failed: list[str] = []
-    for rel, approx_mb in MODEL_FILES:
-        dest = target / Path(rel)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if dest.is_file() and dest.stat().st_size > 1024:
-            print(f"  跳过 {rel}（已存在 {dest.stat().st_size / 1024 / 1024:.1f} MB）")
-            continue
-        url = f"{HF_BASE}/{rel}"
-        print(f"  下载 {rel} (~{approx_mb} MB) ...", end="", flush=True)
-        try:
-            tmp = dest.with_suffix(dest.suffix + ".part")
-            with urllib.request.urlopen(url, timeout=120) as resp, tmp.open("wb") as fh:  # noqa: S310
-                while chunk := resp.read(1 << 20):
-                    fh.write(chunk)
-            tmp.replace(dest)
-            print(f" ok ({dest.stat().st_size / 1024 / 1024:.1f} MB)")
-        except Exception as e:  # noqa: BLE001
-            print(f" 失败：{e}")
-            failed.append(rel)
-
-    if failed:
-        print("\n以下文件下载失败：" + ", ".join(failed))
-        print("网络不通时可用 HF 镜像：把 HF_ENDPOINT=https://hf-mirror.com 设进环境变量后重试。")
-        return 1
-    print("\n✓ 模型就绪。跑 `voice-ctl doctor` 确认。")
-    return 0
+    failed = download_asr_model(target, force=getattr(args, "force", False))
+    return 1 if failed else 0
 
 
 def cmd_fetch_decision(args: argparse.Namespace) -> int:
@@ -525,86 +440,40 @@ def cmd_listen(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """常驻：全局热键按住说话。这是最终形态。"""
+    """常驻：全局热键按住说话。这是命令行形态的最终形态。"""
     rt = _build_rt_or_die(args)
     if rt is None:
         return 2
     cfg = rt.cfg
-    pipe = rt.pipeline()
 
-    from .hotkey import HotkeyError, HotkeyListener, HotkeyTimer
-
-    print(f"voice-ctl {__version__}")
-    print(cfg.describe())
-    print("\n加载识别模型 ...", end="", flush=True)
+    # 事件总线已经在 main() 里接了控制台 sink，这里只管开引擎、转主循环。
+    engine = Engine(cfg, dry_run=args.dry_run)
     try:
-        rt.asr.load()
-    except AsrError as e:
-        print(f"\n✗ {e}")
-        return 2
-    _say(f" ok（{rt.asr.load_ms:.0f}ms，常驻内存）")
-
-    rec = Recorder(device=cfg.audio.device or None, max_duration_ms=cfg.hotkey.max_duration_ms)
-
-    def handle_recording(r) -> None:  # noqa: ANN001
-        out = pipe.process_audio(r.samples, dry_run=args.dry_run)
-        if cfg.feedback.print_result:
-            print(out.report(verbose=args.verbose))
-
-    # 会话状态机抽到 session.py：并发路径（监听线程 + 超时主循环）必须可单测。
-    controller = SessionController(
-        recorder=rec,
-        timer=HotkeyTimer(cfg.hotkey.max_duration_ms, lambda: None),
-        on_recording_start=lambda: (
-            play_beep(cfg.feedback.beep_start_hz, cfg.feedback.beep_ms)
-            if cfg.feedback.beep
-            else None
-        ),
-        on_recording_end=lambda: (
-            play_beep(cfg.feedback.beep_end_hz, cfg.feedback.beep_ms)
-            if cfg.feedback.beep
-            else None
-        ),
-        on_recording_ready=handle_recording,
-        on_too_short=lambda ms: _say(f"· 太短（{ms:.0f}ms），忽略"),
-        on_gated=lambda reason: _say(
-            f"· {reason}，忽略（若确实说话了，把 [audio].min_peak 调低）"
-        ),
-        on_error=lambda msg: _say(f"✗ {msg}"),
-        min_duration_ms=cfg.hotkey.min_duration_ms,
-        min_peak=cfg.audio.min_peak,
-        recorder_error=RecorderError,
-    )
-    # 超时守护接到会话上：录音超时由 controller.timeout() 统一收尾
-    controller.timer = HotkeyTimer(cfg.hotkey.max_duration_ms, controller.timeout)
-
-    def on_press() -> None:
-        controller.press()
-        if controller.recording:
-            print("● 录音中 ...", end="", flush=True)
-
-    def on_release() -> None:
-        controller.release()
-
-    try:
-        listener = HotkeyListener(cfg.hotkey.keys, on_press=on_press, on_release=on_release)
-        listener.start()
-    except HotkeyError as e:
-        print(f"✗ {e}")
-        return 2
-
-    print(f"\n✓ 就绪。按住 {cfg.hotkey.keys} 说话，松开执行。Ctrl+C 退出。", flush=True)
-    print("  （若热键无反应，可能是被别的程序占用；换一个键试试）", flush=True)
-
-    try:
+        if not engine.load_model():
+            return 2
+        if not engine.start():
+            return 2
+        print("\n  （若热键无反应，可能是被别的程序占用；换一个键试试）", flush=True)
         while True:
-            controller.timer.tick()  # type: ignore[attr-defined]
+            engine.tick()
             time.sleep(0.05)
     except KeyboardInterrupt:
         print("\n退出中 ...")
-        listener.stop()
-        controller.abort()
+    finally:
+        engine.close()
     return 0
+
+
+def cmd_ui(args: argparse.Namespace) -> int:
+    """打开图形界面。日志、快捷键、功能、设置都在里面。"""
+    try:
+        from .ui import run_ui
+    except ImportError as e:  # pragma: no cover - 精简 Python 可能没带 tkinter
+        print(f"✗ 无法加载图形界面：{e}")
+        print("  这个 Python 没带 tkinter。官方安装包默认带；conda/精简版可能需要单独装。")
+        print("  命令行功能不受影响，可以继续用 run / doctor / simulate。")
+        return 2
+    return run_ui(args.config, dry_run=args.dry_run)
 
 
 # --------------------------------------------------------------------------- #
@@ -618,16 +487,22 @@ def build_parser() -> argparse.ArgumentParser:
         description="按住快捷键说话 → 本地离线识别 → 执行动作。纯离线，无需联网。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="典型用法：\n"
+        "  voice-ctl ui                  打开图形界面（日志 / 快捷键 / 功能 / 设置）\n"
         "  voice-ctl doctor              检查环境、配置、动作、麦克风\n"
         "  voice-ctl download            下载识别模型（首次必做）\n"
         "  voice-ctl test                用样例音频验证识别\n"
         "  voice-ctl simulate 打开微信   不开麦克风，直接测匹配\n"
-        "  voice-ctl run                 常驻，按住热键说话\n",
+        "  voice-ctl run                 常驻，按住热键说话（无界面）\n",
     )
     p.add_argument("-c", "--config", default=None, help="配置文件路径（默认 ./config.toml）")
+    p.add_argument("-q", "--quiet", action="store_true", help="只输出警告与错误")
     p.add_argument("-V", "--version", action="version", version=f"voice-ctl {__version__}")
 
     sub = p.add_subparsers(dest="cmd", metavar="命令")
+
+    sp = sub.add_parser("ui", help="打开图形界面（日志 / 快捷键 / 功能 / 设置）")
+    sp.add_argument("--dry-run", action="store_true", help="界面上默认只报告不执行")
+    sp.set_defaults(func=cmd_ui)
 
     sp = sub.add_parser("doctor", help="检查环境与配置")
     sp.set_defaults(func=cmd_doctor)
@@ -637,6 +512,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("download", help="下载 SenseVoice 模型")
     sp.add_argument("--dir", default=None, help="目标目录（默认取配置里的 [model].dir）")
+    sp.add_argument("--force", action="store_true", help="即使文件已存在也重新下载")
     sp.set_defaults(func=cmd_download)
 
     sp = sub.add_parser(
@@ -694,20 +570,33 @@ def _say(*args: object, **kw: object) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     # 编码与缓冲：必须在任何中文输出之前。见 bootstrap.setup_console 的说明。
+    # 事件总线也要在解析参数之前接上：连 argparse 的报错都该进日志文件。
+    from . import events
     from .bootstrap import setup_console
 
     setup_console()
+    raw_out = events.install_stream_tee()
 
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "cmd", None):
         parser.print_help()
         return 0
+
+    # `ui` 自己管显示：界面里已经有日志面板，再往控制台打一份纯属重复；
+    # 而且控制台马上会被藏起来，写了也没人看。
+    if args.cmd != "ui":
+        events.attach_console(min_level="warn" if args.quiet else "info")
+    events.attach_file()
+
     try:
         return int(args.func(args) or 0)
     except KeyboardInterrupt:
         print("\n已中断")
         return 130
+    finally:
+        events.get_bus().flush(0.5)
+        raw_out()
 
 
 if __name__ == "__main__":

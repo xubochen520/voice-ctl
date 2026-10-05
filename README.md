@@ -6,8 +6,46 @@
 
 - **纯离线**：识别模型跑在本地，音频不出机器
 - **低开销**：无 GPU、无 torch，模型常驻约 350MB，识别 RTF≈0.04
+- **有界面**：双击就有窗口——实时日志、录热键、改动作、调参数，不用碰配置文件
 - **可拓展**：加一个新能力 = 在 `config.toml` 里加一段 `[[action]]`，不用改代码
 - **可解释**：`--dry-run` 能看到它听成了什么、匹配了哪条、为什么
+
+---
+
+## 界面
+
+双击 exe（或 `voice-ctl ui`）就打开：
+
+```
+┌─ voice-ctl 0.2.0 ──────────────────────── ● 运行中 ─┐
+│  ▶ 运行    │  状态   ● 运行中  ● 16 个动作  ● 模型已加载 │
+│  ≡ 日志    │        热键 [Ctrl]+[Alt]+[空格]           │
+│  ⌨ 快捷键  │        [启动监听] [加载识别模型] [重新加载] │
+│  ✦ 功能    │  试一句  [____________________]  [发送]    │
+│  ⚙ 设置    │  最近一次  ✓ 已启动 notepad.exe  总 118ms  │
+│  ⓘ 关于    │                                          │
+├──────────────────────────────────────────────────────┤
+│ [启动监听] [加载模型]      未启动·按下 0·完成 0·识别 0  │
+└──────────────────────────────────────────────────────┘
+```
+
+| 页面 | 能干什么 |
+|---|---|
+| **运行** | 看状态、启停监听、按住热键说话、**打字试一句**（走完全相同的链路，只是跳过录音） |
+| **日志** | 实时事件流，按级别/关键字过滤、暂停、导出；同时写一份到 `voice-ctl.log` |
+| **快捷键** | 点一下、按下组合键就录好了；自动拦掉 `Ctrl+Space`（输入法）、`Alt+F4` 这类被系统抢走的组合 |
+| **功能** | 列出所有动作和它们的「说法」，逐个显示「现在能不能跑通」；改说法、改目标、增删、试运行 |
+| **设置** | 麦克风、静音阈值、匹配阈值、语义层——都带一句「这个值为什么是这个数」 |
+| **关于** | 路径、依赖版本、一键完整体检，出问题直接把结果复制到 issue |
+
+三件在别的工具里经常出事、这里专门做了处理的事：
+
+1. **保存只改动的行**。点保存不会把你的 `config.toml` 重写一遍——注释、空行、
+   你自己偏好的写法全部原样保留，并且留一份 `config.toml.bak`。
+2. **写不出来就不写**。改完的配置会先真的加载一遍，加载不了就整个放弃写入
+   （你的文件一个字节都不动），而不是留下一个下次启动就起不来的配置。
+3. **界面里看到的日志就是真实发生的事**。界面和识别跑在同一个进程、同一条事件流上，
+   不存在「UI 显示一套、实际跑另一套」。
 
 ---
 
@@ -15,12 +53,21 @@
 
 ### 方式一：下载 exe（无需 Python）
 
-到 [Releases](https://github.com/xubochen520/voice-ctl/releases) 下 `voice-ctl-*-win64-lite.exe`：
+到 [Releases](https://github.com/xubochen520/voice-ctl/releases) 下 `voice-ctl-*-win64-lite.exe`，**双击**即可：
+
+```
+双击              → 打开界面
+设置页 → 下载模型  → 226MB，界面里下，进度打在日志页
+运行页 → 启动监听  → 按住 Ctrl+Alt+Space 说话
+```
+
+也可以走命令行：
 
 ```powershell
-.\voice-ctl-0.1.0-win64-lite.exe download   # 首次：下识别模型（226MB）
-.\voice-ctl-0.1.0-win64-lite.exe --selftest # 自检：确认依赖/模型/麦克风都正常
-.\voice-ctl-0.1.0-win64-lite.exe            # 直接跑，按住 Ctrl+Alt+Space 说话
+.\voice-ctl-0.2.0-win64-lite.exe download   # 首次：下识别模型（226MB）
+.\voice-ctl-0.2.0-win64-lite.exe --selftest # 自检：依赖/界面/模型/麦克风逐项检查
+.\voice-ctl-0.2.0-win64-lite.exe            # 打开界面
+.\voice-ctl-0.2.0-win64-lite.exe run        # 不开界面，常驻监听（适合开机自启）
 ```
 
 首次运行会在 exe 旁边生成 `config.toml`，改热键、加动作都改它。
@@ -46,17 +93,17 @@ voice-ctl download
 # 3. 体检：配置、模型、依赖、动作、麦克风逐项检查
 voice-ctl doctor
 
-# 4. 不开麦克风，先用文字验证匹配链路
-voice-ctl simulate "打开记事本" "把音量调小一点" "截屏"
+# 4. 打开界面
+voice-ctl ui
 
-# 5. 试录音 + 真识别
-voice-ctl record --seconds 3 --transcribe
+# 5. 或者不开界面，先用文字验证匹配链路
+voice-ctl simulate "打开记事本" "把音量调小一点" "截屏"
 
 # 6. 常驻运行：按住 Ctrl+Alt+Space 说话，松开执行
 voice-ctl run
 ```
 
-第 6 步之后就可以一直挂着，托盘式后台运行。
+界面用的是**标准库自带的 tkinter**，不额外装 Qt/Electron，打包后只多几 MB。
 
 ### 为什么是 Ctrl+Alt+Space 而不是 Ctrl+Space
 
@@ -69,6 +116,7 @@ voice-ctl run
 
 | 命令 | 作用 |
 |---|---|
+| `ui` | **打开图形界面**（日志 / 快捷键 / 功能 / 设置 / 关于） |
 | `doctor` | 体检：配置/模型/依赖/动作/热键/麦克风，并逐个动作预检 |
 | `devices` | 列出可用麦克风（把序号填进 `[audio].device`） |
 | `download` | 下载 SenseVoice 识别模型（约 226MB，必做） |
@@ -77,9 +125,12 @@ voice-ctl run
 | `simulate <文本...>` | **不开麦克风**，直接测「归一化 → 匹配 → 执行」 |
 | `record --seconds N --transcribe` | 录一段 wav 并识别，带麦克风质量诊断 |
 | `listen --rounds N` | 单次录音并执行（调试用，不装全局热键） |
-| `run` | **最终形态**：常驻，按住热键说话 |
+| `run` | 不开界面，常驻监听热键（适合开机自启） |
 
 所有命令都支持 `--dry-run`（只显示会做什么）和 `-c/--config` 指定配置。
+`-q/--quiet` 只输出警告与错误。
+
+无参数双击 exe 等于 `ui`；想让它开机就静静挂在后台，用 `run`。
 
 ---
 
@@ -143,7 +194,28 @@ HANDLERS["my_handler"] = MyAction
 按住热键 ──► 录音 ──► SenseVoice 识别 ──► 归一化 ──► 匹配 ──► 执行
    │          16kHz      int8 ONNX       同音纠正    别名/模糊   动作 handler
    └─ 松开停止             ~90ms        口语词剥离    ~1ms
+        │
+        └─► 事件总线 ──► 控制台（带颜色） / 界面（实时日志） / voice-ctl.log
 ```
+
+### 为什么识别不在热键线程里跑
+
+pynput 的回调就是 Windows 的**低级键盘钩子过程**。整条「识别 + 执行」实测
+100–250ms，一旦超过系统的 `LowLevelHooksTimeout`（默认 300ms），Windows 会
+**悄悄把钩子摘掉**——表现是「按几次之后热键忽然没反应了」，重启才好，而且
+日志上什么都看不到。
+
+所以钩子线程只做状态转移和停止录音，识别与执行丢给一条**单工作线程**。
+单线程而不是线程池，是为了保证「日志顺序 = 实际发生顺序」。
+
+### 运行期只发事件，不 print
+
+界面要显示日志，但日志不能靠界面去解析 stdout：stdout 一旦被重定向就什么都
+收不到，常驻进程的 print 还是块缓冲的。所以运行期只做一件事——emit 结构化
+事件，谁来消费由订阅方决定（控制台 sink / 界面轮询 / 文件 sink）。
+
+emit 本身必须**微秒级返回**（它跑在钩子线程里），所以真正的写盘和控制台输出
+在唯一的后台线程上做；被 tee 捞进来的裸输出（traceback、C++ 库的打印）也走同一条路。
 
 ### 第 0 层：别名匹配（默认，负责绝大部分指令）
 
@@ -335,7 +407,7 @@ voice-ctl simulate "你说的话" --dry-run
 
 ```powershell
 .venv\Scripts\pip install -e ".[dev]"
-.venv\Scripts\python -m pytest                      # 269 个单测，约 4 秒
+.venv\Scripts\python -m pytest                      # 412 个单测，约 30 秒（含真实建窗的界面冒烟测试）
 .venv\Scripts\python scripts\bench_e2e.py           # 端到端基准（需先 make_tts_samples.py）
 .venv\Scripts\python scripts\probe_decision.py      # 语义层实测（需先 fetch-decision）
 .venv\Scripts\python scripts\diag_appfind.py        # 应用定位排障：逐级打印找没找到
@@ -353,8 +425,18 @@ voice-ctl simulate "你说的话" --dry-run
 
 ```
 voice_ctl/
-├── cli.py         命令行入口（doctor/download/fetch-decision/test/simulate/listen/record/run）
+├── cli.py         命令行入口（ui/doctor/download/fetch-decision/test/simulate/listen/record/run）
+├── runner.py      运行引擎（热键+录音+识别+执行），CLI 与界面共用
+├── events.py      事件总线：控制台/文件/界面三个 sink，emit 必须微秒级返回
+├── ui/            图形界面（tkinter）
+│   ├── window.py     主窗口：顶栏 + 侧栏 + 内容区 + 底栏，轮询事件总线
+│   ├── theme.py      配色/字体/DPI，以及全部 ttk 样式
+│   ├── widgets.py    通用控件（导航项、卡片、自绘复选框、键位胶囊、日志面板）
+│   └── tab_*.py      六个页面：运行 / 日志 / 快捷键 / 功能 / 设置 / 关于
 ├── config.py      TOML 加载 + 严格类型校验
+├── confedit.py    配置回写：只写差异，写前必须能读回来
+├── toml_edit.py   保留注释的定点 TOML 改写
+├── fetch.py       模型下载（CLI 与界面共用）
 ├── asr.py         SenseVoice 封装（sherpa-onnx）
 ├── recorder.py    push-to-talk 录音 + 峰值静音门
 ├── hotkey.py      全局热键状态机 + 超时守护

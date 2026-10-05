@@ -217,6 +217,40 @@ def writable_temp_dir() -> Path:
     return d
 
 
+def log_path() -> Path:
+    """运行日志。放可写数据目录，UI 的「打开日志」按钮指向这里。"""
+    return data_dir() / "voice-ctl.log"
+
+
+def hide_own_console() -> bool:
+    """如果当前控制台是**为本进程单独创建**的，就把它藏起来。
+
+    UI 模式下控制台窗口是纯噪音（用户要的是窗口，不是一个黑框跟着）。
+    但绝不能无条件藏——从 cmd/PowerShell 里跑 `voice-ctl ui` 时，
+    GetConsoleWindow() 返回的是**用户自己的终端**，藏掉等于把人家终端弄没了。
+
+    判据用 GetConsoleProcessList：只有本进程挂在上面，说明这个控制台
+    是双击 exe 时 Windows 专门开的，可以放心藏。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        hwnd = k32.GetConsoleWindow()
+        if not hwnd:
+            return False
+        buf = (ctypes.c_uint32 * 8)()
+        n = k32.GetConsoleProcessList(buf, 8)
+        if n != 1:
+            return False
+        k32.ShowWindow(hwnd, 0)  # SW_HIDE
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def describe() -> str:
     """给 `doctor` 用的路径诊断信息。"""
     bundle = _bundle_dir()
