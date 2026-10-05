@@ -67,6 +67,8 @@ class ResolvedApp:
     """开始菜单的 AppID（exe 路径 / UWP 的 `包名!应用`）。"""
     system: str = ""
     """系统命令名（notepad / calc…）。"""
+    exe_path: str = ""
+    """完整 exe 路径（能拿到就给）。关闭应用靠它定位进程，别靠文件名。"""
     score: float = 1.0
     how: str = "action"
     """action / exact / name / nickname / pinyin… —— 事后解释"为什么是它"。"""
@@ -326,6 +328,7 @@ def resolve_app(
             name=top.entry.name,
             appid=top.entry.appid,
             system=top.entry.system,
+            exe_path=top.entry.exe_path,
             score=top.score,
             how=top.how,
         ),

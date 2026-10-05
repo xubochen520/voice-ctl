@@ -96,14 +96,30 @@ voice-ctl llm "有个文件要改一下"
 
 ### 关闭应用
 
-「关闭微信」「把微信关掉」「强制关闭微信」现在是真的关闭。一条重要的取舍：
+「关闭微信」「把微信关掉」「强制关闭微信」现在是真的关闭。三条实测踩出来的规矩：
 
-> **有窗口的进程不带 `/F`**。`taskkill /F` 是"立刻终止"，Word 里没保存的文档
-> 会直接没。所以先用 `tasklist /V` 看那个进程有没有标题窗口：有就走优雅关闭
-> （它来得及弹"要保存吗"），没有（后台常驻）才强制。
+> **按路径精确定位，不按进程名。** 这台机器上三个完全不同的启动器都叫
+> `launcher.exe`（米哈游 / 鸣潮 / 鹰角）。按进程名关，用户说「关闭米哈游启动器」
+> 会把鸣潮和鹰角一起关掉——而他多半不会立刻把这两件事联系起来。
+> 所以：能拿到完整路径就按路径找到那**一个** PID 再关。
 >
+> **UWP 应用（记事本、计算器）在开始菜单里是 AUMID，没有 exe 路径。** 这时
+> 我们拿系统命令名推出 `notepad.exe`，再从进程表里认领一个**同名**进程的完整
+> 路径——认领的前提是名字真的相同（`notepad++.exe` 不算）。
+> 直接按映像名 `taskkill /IM` 关它，实测 8 次错 3 次；按 PID 关，12 次全成。
+>
+> **有窗口的进程不带 `/F`。** `/F` 是立刻终止，Word 里没保存的文档会直接没。
+> 所以先发优雅关闭，等 1.5 秒还没退才降级强杀。
 > `explorer.exe` 是例外：它就是桌面本身，杀它会把任务栏和图标一起带走，
 > 所以只关它的窗口。
+
+还有两条关于**怎么判断成功**的：
+
+- **不看 `taskkill` 的退出码**。实测目标确实关了、退出码却是 1。判据是
+  "那个 PID 还在不在"（`OpenProcess` + `WaitForSingleObject`，6ms）。
+  照着退出码报错，用户会看到「没能关掉」而窗口其实已经消失。
+- **没在跑就说没在跑**。「它本来就没开」和「开着但关不掉（要管理员权限）」
+  对用户是两件事，不能都报成一句"没找到"。
 
 ### 日程 / 提醒
 
@@ -619,7 +635,7 @@ voice-ctl simulate "你说的话" --dry-run
 
 ```powershell
 .venv\Scripts\pip install -e ".[dev]"
-.venv\Scripts\python -m pytest                      # 943 个单测，约 39 秒（含真实建窗的界面冒烟测试）
+.venv\Scripts\python -m pytest                      # 962 个单测，约 42 秒（含真实建窗的界面冒烟测试）
 .venv\Scripts\python scripts\bench_e2e.py           # 端到端基准（需先 make_tts_samples.py）
 .venv\Scripts\python scripts\probe_decision.py      # 语义层实测（需先 fetch-decision）
 .venv\Scripts\python scripts\diag_appfind.py        # 应用定位排障：逐级打印找没找到
@@ -688,9 +704,13 @@ sherpa-onnx   语音识别（含 onnxruntime）
 sounddevice   录音（PortAudio）
 pynput        全局热键
 numpy         音频处理
+psutil        列进程（关闭应用要用它精确定位是哪一支）
 ```
 
 可选：`pypinyin`（中文同音消歧，建议装）、`laya[onnx]`（Laya 语义层）。
+
+`psutil` 不是硬依赖：拿不到就退回 PowerShell + WMI，只是慢一些
+（实测 16ms vs 677ms，423 个进程）。
 
 **内置小模型层不引入任何 Python 依赖**——它用的是标准库 `urllib` 加一份
 llama.cpp 的二进制（39.8MB，`voice-ctl llm --install` 下载）。

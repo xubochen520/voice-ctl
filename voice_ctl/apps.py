@@ -156,6 +156,22 @@ class AppEntry:
     """系统命令名（notepad / calc …）。「记事本」这类自带应用靠它兜底。"""
     pinyin: str = ""
 
+    @property
+    def exe_path(self) -> str:
+        """开始菜单里记的完整 exe 路径（不是 exe 路径就是空串）。
+
+        **关闭应用要靠它，不能靠 exe 文件名。** 实测这台机器上三个完全不同的
+        启动器都叫 `launcher.exe`：
+            米哈游启动器  E:\\mihoyou\\miHoYo Launcher\\launcher.exe
+            鸣潮          E:\\Wuthering Waves\\launcher.exe
+            鹰角启动器    E:\\Hypergryph Launcher\\Launcher.exe
+        拿 `taskkill /IM launcher.exe` 去关米哈游，会把鸣潮和鹰角一起关掉。
+        """
+        a = self.appid
+        if a and not a.startswith("{") and a.lower().endswith(".exe"):
+            return a
+        return ""
+
     def resolved(self) -> Resolved:
         """变成 appfind 能启动的东西。"""
         if self.appid:

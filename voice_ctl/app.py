@@ -314,6 +314,8 @@ class Pipeline:
                 "app": intent.app,
                 "app_name": intent.app.name,
                 "exe_names": _exe_names(intent.app),
+                # 完整路径要一起带上：只靠 exe 文件名关进程是危险的，见 _exe_paths
+                "exe_paths": _exe_paths(intent.app),
                 "force": intent.polarity == "force",
             }
         return {}
@@ -449,4 +451,14 @@ def _exe_names(app) -> list[str]:  # noqa: ANN001 - intent.ResolvedApp
         # UWP：只能按包族名找进程，进程名不一定是应用名（计算器是 CalculatorApp.exe）
         out.append(f"pfn:{pfn}")
     return out
+
+
+def _exe_paths(app) -> list[str]:  # noqa: ANN001 - intent.ResolvedApp
+    """完整 exe 路径（能拿到就给）。关闭应用**优先**按它匹配进程。
+
+    为什么不能只靠进程名：实测这台机器上三个不同的启动器都叫 `launcher.exe`
+    （米哈游 / 鸣潮 / 鹰角）。`taskkill /IM launcher.exe` 会把三个一起关掉——
+    用户说「关闭米哈游启动器」，鸣潮和鹰角跟着消失。
+    """
+    return [p for p in (getattr(app, "exe_path", ""),) if p]
 

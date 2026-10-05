@@ -13,12 +13,21 @@
 
 from __future__ import annotations
 
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from voice_ctl.actions import ActionContext, build_registry, close_plan_for, normalize_exe
+from voice_ctl.actions import (
+    ActionContext,
+    Proc,
+    build_registry,
+    close_plan_for,
+    normalize_exe,
+    pid_alive,
+    running_processes,
+)
 from voice_ctl.actions.schedule_action import ScheduleAction, reset_stores, store_for
 from voice_ctl.app import Pipeline
 from voice_ctl.apps import AppIndex
@@ -208,30 +217,254 @@ def test_normalize_exe(raw: str, want: str):
     assert normalize_exe(raw) == want
 
 
+# --------------------------------------------------------------------------- #
+# 关闭的定位：按路径，不按映像名
+#
+# 这一整套来自用户的实测报告：「关闭米哈游启动器」报
+# `没找到正在运行的 launcher.exe`。顺着查下去发现**这台机器上三个完全不同的
+# 启动器都叫 launcher.exe**（米哈游 / 鸣潮 / 鹰角），也就是说按映像名去关，
+# 会把三家的启动器一起关掉——而用户说关米哈游，多半不会立刻把这两件事联系起来。
+# --------------------------------------------------------------------------- #
+
+LAUNCHERS = [
+    Proc(100, "launcher.exe", r"E:\mihoyou\miHoYo Launcher\launcher.exe"),
+    Proc(200, "launcher.exe", r"E:\Wuthering Waves\launcher.exe"),
+    Proc(300, "Launcher.exe", r"E:\Hypergryph Launcher\Launcher.exe"),
+]
+MHY = r"E:\mihoyou\miHoYo Launcher\launcher.exe"
+
+
+def test_path_lookup_targets_exactly_one_pid():
+    """有完整路径时只针对那一个 PID，同名的另外两个不受牵连。
+
+    注意这里**没有** `/f`：有路径时一律先发优雅关闭，真的没退才降级强杀
+    （见 CloseAppAction.execute）。查一次窗口要 400ms，而用户松开热键正等着
+    结果——先优雅再降级得到的结果一样，但快得多。
+    """
+    plan = close_plan_for(["launcher.exe"], paths=[MHY], procs=LAUNCHERS,
+                          has_window=lambda e: False, describe="米哈游启动器")
+    assert plan == [("米哈游启动器", "pid", "100")]
+
+
+def test_a_dead_target_is_not_replaced_by_its_namesakes():
+    """要关的那个没在跑 → **什么都不做**。
+
+    绝不能退回 `taskkill /IM launcher.exe`：用户关了米哈游，结果鸣潮和鹰角
+    跟着消失，而他根本不知道发生了什么。
+    """
+    plan = close_plan_for(["launcher.exe"], paths=[MHY], procs=LAUNCHERS[1:],
+                          has_window=lambda e: False, describe="米哈游启动器")
+    assert plan == [], "目标没在跑时不许误伤同名进程"
+
+
+def test_nothing_running_means_nothing_running():
+    plan = close_plan_for(["launcher.exe"], paths=[MHY], procs=[],
+                          has_window=lambda e: False, describe="米哈游启动器")
+    assert plan == []
+
+
+def test_path_matching_ignores_case_and_slash_direction():
+    """开始菜单给的路径和进程报的路径，大小写与斜杠方向可能不同。"""
+    plan = close_plan_for([], paths=["e:/MIHOYOU/miHoYo Launcher/LAUNCHER.EXE"],
+                          procs=LAUNCHERS, has_window=lambda e: False)
+    assert plan == [("launcher.exe", "pid", "100")]
+
+
+def test_force_is_honoured_on_the_pid_path():
+    plan = close_plan_for(["launcher.exe"], paths=[MHY], procs=LAUNCHERS,
+                          has_window=lambda e: False, force=True, describe="米哈游启动器")
+    assert plan == [("米哈游启动器", "pid", "100/f")]
+
+
+def test_name_lookup_is_still_the_fallback():
+    """认领不到**路径**时（同名进程都在跑、但读不到路径）才按映像名走——
+    这条路不安全，所以只有真的没别的办法时才用。"""
+    procs = [Proc(44, "notepad.exe", "")]
+    plan = close_plan_for(["notepad.exe"], paths=[], procs=procs,
+                          has_window=lambda e: True, describe="记事本")
+    assert plan == [("记事本", "taskkill", "notepad.exe")]
+
+
+# --------------------------------------------------------------------------- #
+# UWP 应用：开始菜单给的是 AUMID，没有 exe 路径
+#
+# 用户的实测报告就是这样一条：「关闭记事本」时灵时不灵。查下来是
+# `记事本` 在开始菜单里是 `Microsoft.WindowsNotepad_…!App`（AUMID，没有路径），
+# 只能拿系统命令名推出 `notepad.exe`，而它的真身是
+# `...\WindowsApps\...\Notepad.exe`。按映像名 `taskkill /IM` 关它 8 次错 3 次；
+# 改成先从进程表里认领同名进程的完整路径、再按 PID 关，10 次全成。
+# --------------------------------------------------------------------------- #
+
+NOTEPAD_DIR = r"C:\Program Files\WindowsApps\Microsoft.WindowsNotepad_11.0_x64__8wekyb3d8bbwe"
+NOTEPAD_EXE = NOTEPAD_DIR + r"\Notepad.exe"
+
+
+def test_uwp_without_a_path_recovers_it_from_the_process_list():
+    """没有 exe 路径时，去进程表里按**同名**认领一个，然后走精确路径。
+
+    注意结果里只有一条 `pid`——认领成功之后**不能**再退回按映像名，
+    否则同一个目标会被关两次，第二次还是不可靠的那种。
+    """
+    procs = [
+        Proc(11, "Notepad.exe", NOTEPAD_EXE),
+        Proc(22, "explorer.exe", r"C:\Windows\explorer.exe"),
+    ]
+    plan = close_plan_for(["notepad.exe"], paths=[], procs=procs, describe="记事本")
+    assert plan == [("记事本", "pid", "11")], plan
+    assert not any(m.startswith("taskkill") for _w, m, _a in plan)
+
+
+def test_name_recovery_only_claims_an_exact_image_name_match():
+    """认领的前提是映像名**真的相同**，不能凭"看起来像"。
+
+    `notepad++.exe` 不是 `notepad.exe`：认错了就会去关一个完全无关的程序。
+    这里让 notepad.exe 自己**也在跑**（一个拿得到路径的同名进程），
+    如果实现会去认领 `notepad++.exe`，它就会选错那个 PID。
+    """
+    procs = [
+        Proc(33, "notepad++.exe", r"C:\Program Files\Notepad++\notepad++.exe"),
+        Proc(77, "Notepad.exe", NOTEPAD_EXE),
+    ]
+    plan = close_plan_for(["notepad.exe"], paths=[], procs=procs, describe="记事本")
+    assert plan == [("记事本", "pid", "77")], "不该认领 notepad++.exe"
+
+
+def test_a_pathless_same_name_process_does_not_authorise_name_targeting():
+    """同名进程拿不到路径（权限不足）时，不能就地退回按映像名去关。
+
+    那样会把同名的**那一批**全关掉，包括我们本来没打算碰的。如实按名字处理，
+    让用户看到"可能需要管理员权限"，而不是误伤。
+    """
+    procs = [Proc(44, "weixin.exe", "")]  # 有进程但读不到路径
+    plan = close_plan_for(["weixin.exe"], paths=[], procs=procs,
+                          has_window=lambda e: False, describe="微信")
+    assert plan == [("微信", "taskkill-f", "weixin.exe")], plan
+
+
+def test_name_recovery_picks_the_process_that_has_a_path():
+    """同名进程里有的拿得到路径、有的拿不到，要挑拿得到的那个走精确路径。"""
+    procs = [
+        Proc(44, "Notepad.exe", ""),  # 拿不到路径
+        Proc(55, "Notepad.exe", NOTEPAD_EXE),
+    ]
+    plan = close_plan_for(["notepad.exe"], paths=[], procs=procs, describe="记事本")
+    assert plan == [("记事本", "pid", "55")], plan
+
+
+def test_two_names_never_double_target_the_same_pid():
+    """同一个 PID 只关一次，哪怕它被两个名字指到。"""
+    procs = [Proc(66, "launcher.exe", r"E:\a\launcher.exe")]
+    plan = close_plan_for(["launcher.exe", "LAUNCHER.EXE"], paths=[], procs=procs,
+                          describe="启动器")
+    assert plan == [("启动器", "pid", "66")], plan
+
+
+def test_explorer_is_still_special_on_the_path_route():
+    """按 PID 的那条路也要认 explorer：它是桌面本身，不能杀。"""
+    procs = [Proc(9, "explorer.exe", r"C:\Windows\explorer.exe")]
+    plan = close_plan_for([], paths=[r"C:\Windows\explorer.exe"], procs=procs,
+                          has_window=lambda e: True)
+    assert plan == [("explorer.exe", "explorer", "")]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows 专有")
+def test_running_processes_finds_something_real():
+    """真机上的取进程列表要能用（psutil 不在时走 PowerShell+CIM）。"""
+    procs = running_processes()
+    if not procs:
+        pytest.skip("这台机器上两条路都拿不到进程列表")
+    assert any(p.name for p in procs)
+    assert any(p.path for p in procs), "至少要有一部分进程能拿到完整路径，否则精确定位就是空话"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows 专有")
+def test_pid_alive_notices_a_real_process_coming_and_going():
+    """`pid_alive` 是"关掉了没有"的唯一判据，它必须真的准。
+
+    为什么不能用 taskkill 的退出码：实测目标确实关了、退出码却是 1。
+    照着退出码报错，用户看到「没能关掉」而窗口其实已经消失。
+    """
+    import subprocess
+
+    p = subprocess.Popen(["cmd", "/c", "ping -n 20 127.0.0.1 > nul"])
+    try:
+        assert pid_alive(p.pid) is True, "刚起的进程应当被判为活着"
+    finally:
+        p.kill()
+        p.wait(timeout=10)
+    assert pid_alive(p.pid) is False, "已经退出的进程必须被判为不在"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows 专有")
+def test_pid_alive_treats_a_bogus_pid_as_dead():
+    assert pid_alive(0) is False
+    assert pid_alive(-1) is False
+    assert pid_alive(999_999) is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows 专有")
+def test_closing_a_dead_target_never_touches_a_live_process():
+    """端到端最要紧的一条：目标没在跑时，绝不能真的去执行 taskkill。
+
+    用「一个绝对不存在的 exe 路径」当靶子——它连映像名都对不上任何真进程，
+    所以万一实现退回了按名字关，也必须是空计划。
+    """
+    cfg = AppConfig(actions=[ActionConfig(id="sys.close_app", handler="close_app",
+                                          aliases=["关闭应用"])])
+    act = build_registry(cfg.enabled_actions).get("sys.close_app")
+    assert act is not None
+    ctx = ActionContext(
+        text="关闭这个东西", dry_run=False,
+        extra={"exe_names": ["zzz-not-a-real-program.exe"],
+               "exe_paths": [r"C:\zzz-not-a-real-dir\zzz-not-a-real-program.exe"],
+               "app_name": "不存在的东西"},
+    )
+    r = act.execute(ctx)
+    assert not r.ok and "没在运行" in r.message
+    assert "已关闭" not in r.message
+
+
 def test_explorer_gets_a_window_close_not_a_kill():
     """explorer.exe 就是桌面本身。杀它会把任务栏和图标一起带走。"""
-    plan = close_plan_for(["explorer.exe"], has_window=lambda e: True)
-    assert plan == [("explorer.exe", "explorer")]
+    procs = [Proc(9, "explorer.exe", r"C:\Windows\explorer.exe")]
+    plan = close_plan_for(["explorer.exe"], procs=procs, has_window=lambda e: True)
+    assert plan == [("explorer.exe", "explorer", "")]
 
 
 def test_a_windowed_process_is_closed_gracefully_first():
     """有窗口的进程不带 /F：那是"请关闭"，它来得及让用户存盘。
 
     /F 是立刻终止，Word 里没保存的文档会直接没——这是不可接受的数据损失。
+    用拿不到路径的进程来测，免得被"认领路径"那条更快但不同的路截走。
     """
-    plan = close_plan_for(["winword.exe"], has_window=lambda e: True)
-    assert plan == [("winword.exe", "taskkill")]
+    procs = [Proc(5, "winword.exe", "")]
+    plan = close_plan_for(["winword.exe"], procs=procs, has_window=lambda e: True)
+    assert plan == [("winword.exe", "taskkill", "winword.exe")]
 
 
 def test_a_headless_process_can_only_be_forced():
     """没有窗口的进程，`taskkill` 不带 /F 会直接失败，只能强制。"""
-    plan = close_plan_for(["weixin.exe"], has_window=lambda e: False)
-    assert plan == [("weixin.exe", "taskkill-f")]
+    procs = [Proc(6, "weixin.exe", "")]
+    plan = close_plan_for(["weixin.exe"], procs=procs, has_window=lambda e: False)
+    assert plan == [("weixin.exe", "taskkill-f", "weixin.exe")]
 
 
 def test_force_flag_overrides_graceful():
-    plan = close_plan_for(["微信"], has_window=lambda e: True, force=True)
-    assert plan == [("微信.exe", "taskkill-f")]
+    procs = [Proc(7, "weixin.exe", "")]
+    plan = close_plan_for(["weixin.exe"], procs=procs, has_window=lambda e: True, force=True)
+    assert plan == [("weixin.exe", "taskkill-f", "weixin.exe")]
+
+
+def test_a_name_that_is_not_running_produces_no_plan():
+    """进程表里没有这个名字 → 它没在跑 → **不生成计划**。
+
+    不能只看"有没有可见窗口"就决定发不发 taskkill：`has_visible_window` 要起一个
+    400ms 的 tasklist，而且它答错了会让用户看到「没能关掉」（听起来像权限问题），
+    其实是"它本来就没开"——两件事对用户的含义完全不同。
+    """
+    assert close_plan_for(["weixin.exe"], procs=[], has_window=lambda e: True) == []
+    assert close_plan_for(["weixin.exe"], procs=[Proc(1, "other.exe", "x")],
+                          has_window=lambda e: True) == []
 
 
 def test_close_dry_run_never_kills():

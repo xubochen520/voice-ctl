@@ -131,6 +131,10 @@ hiddenimports = [
     "pynput.mouse._win32",
     "sounddevice",
     "_sounddevice_data",
+    # 关闭应用要用它列进程（16ms vs WMI 的 677ms）。它是 C 扩展，
+    # 静态分析抓得到模块本身，但漏了会变成"运行时 ImportError → 静默退回 WMI"，
+    # 表现只是变慢，很难发现，所以显式写上。
+    "psutil",
     # 图形界面：tkinter 的 tcl/tk 数据目录由 PyInstaller 自带的 hook 收集，
     # 但它只认得到"被 import 过"的模块。界面是延迟 import 的（cli 里才 import
     # voice_ctl.ui），静态分析扫不到，必须显式声明。

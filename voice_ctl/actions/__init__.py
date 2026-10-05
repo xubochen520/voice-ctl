@@ -546,41 +546,220 @@ _GENTLE_HINTS: frozenset[str] = frozenset()
 比维护一张"哪些程序怕被强杀"的名单可靠得多。"""
 
 
+@dataclass(frozen=True)
+class Proc:
+    """一个正在运行的进程。"""
+
+    pid: int
+    name: str
+    """映像名（`launcher.exe`）。**不能拿它单独定位进程**，见 `close_plan_for`。"""
+    path: str = ""
+    """完整路径。拿不到时是空串（权限不足、进程刚退出）。"""
+
+
+def _psutil_procs() -> list[Proc]:
+    import psutil
+
+    out: list[Proc] = []
+    for p in psutil.process_iter(["pid", "name", "exe"]):
+        info = p.info
+        out.append(Proc(int(info.get("pid") or 0), str(info.get("name") or ""),
+                        str(info.get("exe") or "")))
+    return out
+
+
+def _wmi_procs() -> list[Proc]:
+    r = subprocess.run(  # noqa: S603
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+         "Get-CimInstance Win32_Process | "
+         "ForEach-Object { $_.ProcessId.ToString() + \"`t\" + $_.Name + \"`t\" + $_.ExecutablePath }"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    out: list[Proc] = []
+    for line in (r.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2 or not parts[0].strip().isdigit():
+            continue
+        out.append(Proc(int(parts[0]), parts[1].strip(), parts[2].strip() if len(parts) > 2 else ""))
+    return out
+
+
+def running_processes() -> list[Proc]:
+    """列出正在运行的进程（带路径）。失败返回空列表。
+
+    先试 psutil（实测 16ms / 423 个进程），没有就退回 PowerShell + CIM
+    （同样的机器 677ms）。**40 倍差距**落在用户松开热键等结果的那一刻，
+    所以 psutil 进了正式依赖，但仍然保留 WMI 兜底——它在任何 Windows 上都能用，
+    不依赖任何二进制扩展。
+    """
+    try:
+        return _psutil_procs()
+    except Exception:  # noqa: BLE001 - 没装 psutil / 权限不足 / 别的意外，退回 WMI
+        pass
+    try:
+        return _wmi_procs()
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def close_plan_for(
     names: list[str],
     *,
+    paths: list[str] | None = None,
+    procs: list[Proc] | None = None,
     has_window: Callable[[str], bool] | None = None,
     force: bool = False,
-) -> list[tuple[str, str]]:
-    """要关掉这些进程名，各用哪条命令。返回 [(exe 名, 方法)]。
+    describe: str = "",
+) -> list[tuple[str, str, str]]:
+    """要关掉这些东西，各用哪条命令。返回 [(显示名, 方法, 参数)]。
 
-    方法只有三种：
-        taskkill     正常收尾（给它的顶层窗口发关闭消息）
-        taskkill-f   立刻终止
-        explorer     外壳进程专用：只关窗口，不杀进程
+    方法：
+        pid        按 PID 终止某个**确切**的进程（最安全，优先用）
+        taskkill   按映像名让所有同名进程优雅退出
+        taskkill-f 按映像名强制终止所有同名进程
+        explorer   外壳进程专用：只关窗口，不杀进程
 
-    为什么不能一律 /F：/F 是"立刻终止"，Office 这类程序来不及存盘，
-    用户的文档就没了。所以**有窗口**的先走不带 /F 的那条，没有窗口的
-    （后台服务、托盘常驻）不带 /F 会直接失败，只能强制。
+    ## 为什么优先按 PID
 
-    纯函数：窗口有无由调用方注入，测试因此不用真的起进程。
+    用户的实测报告：「关闭米哈游启动器」命中了，但报的是
+    `没找到正在运行的 launcher.exe`。顺着这条线查下去，发现**这台机器上三个
+    完全不同的启动器都叫 launcher.exe**：
+
+        米哈游启动器  E:\\mihoyou\\miHoYo Launcher\\launcher.exe
+        鸣潮          E:\\Wuthering Waves\\launcher.exe
+        鹰角启动器    E:\\Hypergryph Launcher\\Launcher.exe
+
+    也就是说 `taskkill /IM launcher.exe` 会把三个一起关掉。用户说关米哈游，
+    鸣潮和鹰角跟着消失——而且他大概率不会立刻把这两件事联系起来。
+
+    所以：**有完整路径就按路径精确定位进程，只杀那一个 PID**。
+    拿不到路径（UWP、系统命令名兜底）才退回按映像名。
+
+    ## 为什么不能一律 /F
+
+    /F 是"立刻终止"，Office 这类程序来不及存盘。所以有窗口的先走不带 /F 的
+    那条；没有窗口的（后台常驻、托盘程序）不带 /F 会直接失败，只能强制。
+
+    纯函数：进程列表和窗口有无都由调用方注入，测试因此不用真的起进程。
     """
+    procs = running_processes() if procs is None else procs
     probe = has_window or has_visible_window
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, str]] = []
+    seen_pids: set[int] = set()
+
+    # 路径 → 进程。路径比较用小写规范化：Windows 不区分大小写，而且开始菜单给的
+    # 路径和进程报的路径斜杠方向可能不同。
+    by_path: dict[str, Proc] = {}
+    for p in procs:
+        if p.path:
+            by_path[normalize_path(p.path)] = p
+
+    # 映像名 → 进程。**只用来补出"该用哪个路径"，不用来决定关谁。**
+    #
+    # 为什么需要这一步：UWP 应用在开始菜单里是 AUMID（`Microsoft.WindowsNotepad_…!App`），
+    # 没有 exe 路径，只能拿系统命令名推出 `notepad.exe`。可它的真身是
+    # `...\WindowsApps\...\Notepad.exe`——按映像名 `taskkill /IM` 关它时灵时不灵
+    # （实测 8 次里错 3 次），而按 PID 关 10 次全成。
+    #
+    # 所以：有映像名就去进程表里认领一个**同名**进程的完整路径，然后走精确路径。
+    # 认领的前提是名字真的对得上，绝不能凭"看起来像"就认。
+    by_name: dict[str, list[Proc]] = {}
+    for p in procs:
+        key = normalize_exe(p.name)
+        if key:
+            by_name.setdefault(key, []).append(p)
+
+    # 要处理的目标，按"有没有确切路径"分成两拨。
+    want_paths: list[str] = []
+    seen_path_keys: set[str] = set()
+    for raw_path in (paths or []):
+        k = normalize_path(raw_path)
+        if k and k not in seen_path_keys:
+            seen_path_keys.add(k)
+            want_paths.append(raw_path)
+
+    covered: set[str] = set()
+    """已经能按路径定位的映像名。
+
+    这些名字**绝不能**再走"按映像名"那条路——它不可靠，而且会把同名的别的程序
+    一起关掉。所以"路径给了但进程没在跑"的正确结果是**什么都不做**，
+    而不是退回去 `taskkill /IM launcher.exe`（那正是要修的缺陷）。
+    """
+    for raw_path in want_paths:
+        exe = normalize_exe(raw_path)
+        if exe:
+            covered.add(exe)
+    want_names: list[str] = []
     for raw in names:
         exe = normalize_exe(raw)
-        if not exe:
+        if not exe or exe in covered or exe in want_names:
             continue
+        # 先试着**认领一个同名进程的路径**，让它走精确那条路。
+        #
+        # 两个前提，都是实测踩出来的：
+        #   * 映像名要**真的相同**——`notepad++.exe` 不是 `notepad.exe`，
+        #     认错了就会去关一个完全无关的程序；
+        #   * 优先挑**拿得到路径**的那个同名进程——同名的进程里有的读不到路径
+        #     （权限不足），随手挑第一个会白白放弃精确路径。
+        same = [p for p in by_name.get(exe, []) if p.pid]
+        hit = next((p for p in same if p.path), same[0] if same else None)
+        if hit is not None:
+            if hit.path:
+                k = normalize_path(hit.path)
+                if k not in seen_path_keys:
+                    seen_path_keys.add(k)
+                    want_paths.append(hit.path)
+                covered.add(exe)
+                continue
+            # 同名进程一个路径都拿不到。不能就地退回按映像名去关：那会把同名的
+            # **那一批**全关掉，包括我们本来不该碰的。如实按名字处理，让用户
+            # 看到"可能需要管理员权限"，而不是误伤。
+        want_names.append(exe)
+
+    def kill(what: str, exe: str, hit: Proc) -> None:
+        if hit.pid in seen_pids:
+            return
+        seen_pids.add(hit.pid)
+        label = describe or what
         if exe in SHELL_EXES:
-            out.append((exe, "explorer"))
+            out.append((label, "explorer", ""))
+        else:
+            # **不查窗口了。** 有窗口与否只用来决定"先优雅还是直接强杀"，而
+            # `has_visible_window` 每次要起一个 tasklist（实测 400ms）——用户
+            # 松开热键正等着结果，这 400ms 花得不值。改成统一先优雅关闭，
+            # 真的没退再降级强杀（见 CloseAppAction.execute），结果一样而更快。
+            out.append((label, "pid", f"{hit.pid}/f" if force else str(hit.pid)))
+
+    for raw_path in want_paths:
+        hit = by_path.get(normalize_path(raw_path))
+        if hit is not None and hit.pid:
+            kill(normalize_exe(raw_path), normalize_exe(raw_path), hit)
+
+    for exe in want_names:
+        if exe in SHELL_EXES:
+            if any(p.pid for p in by_name.get(exe, [])):
+                out.append((describe or exe, "explorer", ""))
+            continue
+        if not by_name.get(exe):
+            # 进程表里压根没有这个名字 → 它没在跑。**不生成计划**。
+            #
+            # 不能只看"有没有可见窗口"就决定发不发 taskkill：那是在拿一个
+            # 400ms 的旁证去回答一个我们手里已经有答案的问题，而且答错了会
+            # 让用户看到「没能关掉」（听起来像权限问题），其实是"它本来就没开"。
             continue
         if force:
-            out.append((exe, "taskkill-f"))
+            out.append((describe or exe, "taskkill-f", exe))
         elif probe(exe):
-            out.append((exe, "taskkill"))
+            out.append((describe or exe, "taskkill", exe))
         else:
-            out.append((exe, "taskkill-f"))
+            out.append((describe or exe, "taskkill-f", exe))
     return out
+
+
+def normalize_path(raw: str) -> str:
+    """路径比较用的规范形式：小写 + 反斜杠。"""
+    return raw.strip().strip('"').replace("/", "\\").lower()
 
 
 def normalize_exe(raw: str) -> str:
@@ -596,6 +775,85 @@ def normalize_exe(raw: str) -> str:
     if not s.endswith(".exe"):
         s += ".exe"
     return s
+
+
+GRACEFUL_WAIT = 1.5
+"""发完关闭消息后最多等多久（秒）。程序要过一会儿才真的退出。"""
+FORCE_WAIT = 1.0
+"""强制终止后最多等多久（秒）。/F 基本是即时的，等这么久是防卡顿。"""
+
+
+def pid_alive(pid: int) -> bool:
+    """这个 PID 还在不在。
+
+    **不能拿 taskkill 的退出码当结论。** 实测：`taskkill /PID <n>` 目标确实关了，
+    退出码却可能是 1。照着退出码报错的话，用户看到「没能关掉」而窗口其实已经
+    消失——他会以为功能坏了，然后反复重试。
+
+    所以判据是"进程还在不在"这个事实，不是命令的退出码。
+
+    实现上用 `OpenProcess`（内核级，微秒级返回），不用 `tasklist`：后者每次要
+    起一个进程，实测 360ms，而这条路要轮询好几次——用户松开热键正等着结果。
+    """
+    if pid <= 0:
+        return False
+    if sys.platform != "win32":
+        return _pid_alive_slow(pid)
+    try:
+        import ctypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        SYNCHRONIZE = 0x00100000
+        WAIT_TIMEOUT = 0x00000102
+        STILL_ACTIVE = 259
+        h = k32.OpenProcess(SYNCHRONIZE | 0x1000, False, pid)  # 0x1000 = PROCESS_QUERY_LIMITED
+        if not h:
+            err = ctypes.get_last_error()
+            # 5 = 拒绝访问：进程还在，只是我们无权打开它（比如它以管理员身份在跑）。
+            # 报"还活着"比报"已关闭"安全——宁可多报一次失败，也不要谎报成功。
+            return err == 5
+        try:
+            if k32.WaitForSingleObject(h, 0) == WAIT_TIMEOUT:
+                return True
+            code = ctypes.c_ulong()
+            if k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return code.value == STILL_ACTIVE
+            return False
+        finally:
+            k32.CloseHandle(h)
+    except Exception:  # noqa: BLE001 - 拿不准就退回慢的那条
+        return _pid_alive_slow(pid)
+
+
+def _pid_alive_slow(pid: int) -> bool:
+    """`tasklist` 版本。慢（约 360ms）但哪都能用，作为兜底。"""
+    try:
+        r = subprocess.run(  # noqa: S603
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    out = r.stdout or ""
+    if "No tasks" in out or "没有运行" in out:
+        return False
+    return str(pid) in out
+
+
+def _wait_gone(pid: int, timeout: float) -> bool:
+    """等这个进程消失，最多 timeout 秒。返回它是否真的没了。
+
+    轮询而不是 sleep 固定时长：大多数程序几十毫秒就退了，干等 1.5 秒会让
+    「关闭微信」这句话平白慢一倍。实测有窗口的程序平均在 100-400ms 内退出。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if not pid_alive(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def has_visible_window(exe: str) -> bool:
@@ -642,32 +900,74 @@ class CloseAppAction(Action):
         return ActionResult(True, f"将关闭 {'、'.join(names)}")
 
     def execute(self, ctx: ActionContext) -> ActionResult:
-        if ctx.dry_run:
-            names = ctx.extra.get("exe_names") or self._names()
-            return ActionResult(True, f"[dry-run] 将关闭 {'、'.join(names) or '(未指定)'}")
         names = [str(n) for n in (ctx.extra.get("exe_names") or self._names())]
+        paths = [str(p) for p in (ctx.extra.get("exe_paths") or [])]
         force = bool(ctx.extra.get("force"))
-        if not names:
+        label = str(ctx.extra.get("app_name") or "")
+        if not names and not paths:
             return ActionResult(False, "不知道该关哪个进程", "没解析出应用名")
+
+        if ctx.dry_run:
+            plan = close_plan_for(names, paths=paths, force=force, describe=label)
+            if not plan:
+                return ActionResult(
+                    False, f"{label or '它'}现在没在运行", "dry-run：预览的结果和真跑一致"
+                )
+            how = "；".join(f"{d} → {m}" for d, m, _ in plan)
+            return ActionResult(True, f"[dry-run] 将关闭 {how}")
+
+        plan = close_plan_for(names, paths=paths, force=force, describe=label)
+        if not plan:
+            return ActionResult(False, f"{label or '、'.join(names)} 现在没在运行",
+                                "它可能本来就没开")
 
         killed: list[str] = []
         failed: list[str] = []
-        for exe, method in close_plan_for(names, force=force):
+        for what, method, arg in plan:
             if method == "explorer":
                 _close_explorer_windows()
-                killed.append(f"{exe} 的窗口")
+                killed.append(f"{what} 的窗口")
                 continue
-            args = ["taskkill", "/IM", exe] + (["/F"] if method == "taskkill-f" else [])
-            if _run(args):
-                killed.append(exe if method == "taskkill" else f"{exe}（强制）")
+            if method == "pid":
+                pid_s, _, hard = arg.partition("/")
+                pid = int(pid_s)
+                _run(["taskkill", "/PID", pid_s] + (["/F"] if hard else []))
+                if not hard:
+                    # 优雅关闭是**异步**的：taskkill 只是把关闭消息投出去，
+                    # 程序要过一会儿才真的退出。实测记事本/微信只要几十毫秒，
+                    # 但没等就查会看到"还在"——于是同一句话时灵时不灵。
+                    if not _wait_gone(pid, GRACEFUL_WAIT):
+                        # 它不理会关闭消息（托盘常驻、后台服务）。用户说"关闭"
+                        # 就是要它关掉，补一次强制——留一个半死的进程不算完成。
+                        _run(["taskkill", "/PID", pid_s, "/F"])
+                        _wait_gone(pid, FORCE_WAIT)
+                if pid_alive(pid):
+                    failed.append(what)
+                else:
+                    killed.append(what)
+                continue
+            ok = _run(["taskkill", "/IM", arg] + (["/F"] if method == "taskkill-f" else []))
+            if ok:
+                killed.append(what if method != "taskkill-f" else f"{what}（强制）")
             else:
-                failed.append(exe)
+                failed.append(what)
 
         if killed and not failed:
             return ActionResult(True, f"已关闭 {'、'.join(killed)}")
         if killed:
-            return ActionResult(True, f"已关闭 {'、'.join(killed)}", f"没找到：{'、'.join(failed)}")
-        return ActionResult(False, f"没找到正在运行的 {'、'.join(failed)}", "它可能本来就没开")
+            return ActionResult(True, f"已关闭 {'、'.join(killed)}", f"没关掉：{'、'.join(failed)}")
+        # 一条都没关掉。分清"它本来就没开"和"它开着但关不掉"——这两件事对用户
+        # 的含义完全不同：前者不用管，后者要去看权限或者手动关。
+        #
+        # 判据是"计划里有没有按名字兜底的那一条"：按名字走意味着我们在进程表里
+        # **没认出**它（认得出来就会走精确路径了）。所以有按名字的条目 = 它开着
+        # 但我们只能对着映像名喊话，多半是权限问题。
+        by_name_only = any(m in ("taskkill", "taskkill-f") for _w, m, _a in plan)
+        if by_name_only:
+            return ActionResult(False, f"{label or '、'.join(failed)} 没能关掉",
+                                "进程还在——可能需要管理员权限，或者它是开机自启的")
+        return ActionResult(False, f"{label or '、'.join(names)} 现在没在运行",
+                            "它可能本来就没开")
 
 
 def cmds_available(cmd: str) -> bool:

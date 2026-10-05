@@ -4,8 +4,8 @@
 
 | 变体 | 体积 | 首次使用 | 启动耗时 | 适合谁 |
 |---|---|---|---|---|
-| **lite** | 84.0 MB | 需跑一次 `download`（226MB） | **2.4s** | 日常使用（模型放 exe 旁边，启动不解包） |
-| **full** | 236.0 MB | 开箱即用 | 3.8s | 想零配置、或不方便单独下模型 |
+| **lite** | 84.1 MB | 需跑一次 `download`（226MB） | **2.4s** | 日常使用（模型放 exe 旁边，启动不解包） |
+| **full** | 236.1 MB | 开箱即用 | 3.8s | 想零配置、或不方便单独下模型 |
 
 两者功能完全一致，只差识别模型是否内嵌。**常用建议选 lite**：虽然要多下一次，
 但每次启动快一倍——`full` 每次运行都要把 226MB 解包到临时目录。
@@ -40,6 +40,7 @@ Remove-Item Env:\VOICE_CTL_BUNDLE_MODEL
 | `VOICE_CTL_BUNDLE_LLAMA` | 39.8MB llama.cpp 运行时 | **打**——它是"内置小模型层"的前提，而从 GitHub 下载要用户能访问 github.com |
 | `VOICE_CTL_BUNDLE_LLM_MODEL` | 469MB~1GB 的 GGUF 模型 | **别打**——单文件 exe 每次启动都要解包它 |
 | `VOICE_CTL_BUNDLE_MODEL` | 226MB 识别模型 | 看情况（`full` 变体就是它） |
+| （依赖）`psutil` | 约 0.1MB | **打**——关闭应用靠它列进程，16ms vs WMI 的 677ms |
 
 **为什么 GGUF 不该打进 exe**：PyInstaller 的单文件 exe 每次启动都把内嵌数据
 解包到临时目录。0.2.0 实测过这条路的代价——226MB 的识别模型让启动从 1.7s

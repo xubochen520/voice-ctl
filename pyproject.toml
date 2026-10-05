@@ -12,6 +12,10 @@ dependencies = [
     "sounddevice>=0.5",
     "pynput>=1.8",
     "numpy>=1.24",
+    # 关闭应用要列出"哪个进程对应哪个 exe"。没有它只能退回 PowerShell+WMI：
+    # 实测 677ms vs 16ms（423 个进程），而用户松开热键正等着结果。
+    # 不是硬依赖——拿不到就退回 WMI，只是慢一点。
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
