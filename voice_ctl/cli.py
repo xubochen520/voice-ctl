@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import wave
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -334,14 +335,21 @@ def _parse_now(text: str) -> datetime | None:
     return None
 
 
-def cmd_llm(args: argparse.Namespace) -> int:
-    """探测本机大模型服务，并试着让它给几个动作建议。
+def _fmt_progress(p) -> str:  # noqa: ANN001 - llamacpp.Progress
+    if p.total:
+        pct = p.ratio * 100
+        return f"\r  {p.note} {p.done / 1024 / 1024:6.1f}/{p.total / 1024 / 1024:.1f} MB ({pct:5.1f}%)"
+    return f"\r  {p.note} {p.done / 1024 / 1024:6.1f} MB"
 
-    这条命令存在的意义是**先量再开**：`[llm]` 是唯一依赖外部服务的功能，
-    开之前用户应该亲眼看到"它连得上、它挑得对"。没有这条命令，用户只能
-    改配置然后对着麦克风猜。
+
+def cmd_llm(args: argparse.Namespace) -> int:
+    """装运行时 / 下模型 / 探测 / 试句子。
+
+    这条命令存在的意义是**先量再开**：`[llm]` 是唯一需要额外下载几百 MB 的功能，
+    开之前用户应该亲眼看到"它准备好了吗、它挑得对不对、一次花多久"。
     """
-    from .llm import DEFAULT_ENDPOINT, SlotExtractor, candidate_actions
+    from . import llamacpp
+    from .llm import DEFAULT_ENDPOINT, make_client, candidate_actions
 
     try:
         cfg = load_config(args.config)
@@ -349,19 +357,86 @@ def cmd_llm(args: argparse.Namespace) -> int:
         print(f"✗ 配置有问题：{e}")
         return 2
 
-    endpoint = args.endpoint or cfg.llm.endpoint or DEFAULT_ENDPOINT
-    time_s = args.timeout if args.timeout is not None else cfg.llm.timeout
-    ex = SlotExtractor(endpoint, args.model or cfg.llm.model, timeout=time_s)
+    lc = cfg.llm
+    backend = "server" if args.backend == "server" else lc.backend
+    if args.endpoint or args.model or args.backend:
+        lc = replace(
+            lc, backend=backend,
+            endpoint=args.endpoint or lc.endpoint,
+            model=args.model or lc.model,
+        )
+    # 这条命令本身就是"试用"，不该因为 enabled = false 就什么都不给看——
+    # 那样用户得先改配置、再跑一条命令才发现装错了模型。配置只在**运行期**
+    # 生效（engine 里判断），这里只看命令行。
+    lc = replace(lc, enabled=True)
 
-    print(f"探测 {endpoint} …")
-    if not ex.probe(force=True):
-        print(f"✗ 连不上：{ex.last_error}")
-        print("  LM Studio：打开开发者模式里的本地服务（默认端口 1234）")
-        print("  Ollama   ：ollama serve，endpoint 用 http://127.0.0.1:11434/v1")
-        print("  确认端口后：voice-ctl llm --endpoint http://127.0.0.1:1234/v1")
+    # -- 装运行时 ---------------------------------------------------------- #
+    if args.install:
+        print(f"下载 llama.cpp 运行时（{llamacpp.LLAMA_BUILD}，Windows x64 CPU 版）…")
+        print(f"  来源 {llamacpp.WIN_CPU_URL}")
+        try:
+            d = llamacpp.install_runtime(force=args.force, on_progress=lambda p: print(_fmt_progress(p), end=""))
+        except Exception as e:  # noqa: BLE001
+            print(f"\n✗ 安装失败：{e}")
+            return 1
+        files = sorted(x.name for x in d.glob("*"))
+        size = sum(x.stat().st_size for x in d.iterdir() if x.is_file()) / 1024 / 1024
+        print(f"\n✓ 已装到 {d}")
+        print(f"  {len(files)} 个文件，{size:.1f} MB（只留了能跑 llama-server 的最小集）")
+        print(f"  日志：{llamacpp.data_dir() / 'llama-server.log'}")
+
+    # -- 下模型 ------------------------------------------------------------ #
+    if args.download:
+        spec = llamacpp.MODELS.get(args.download if isinstance(args.download, str) else "")
+        if args.download is True or args.download == "":
+            spec = llamacpp.MODELS.get(lc.model, llamacpp.QWEN_05B)
+        if spec is None:
+            print(f"✗ 不认识这个模型名：{args.download}")
+            print("  可选：" + "、".join(f"{m.name}（{m.size_mb:.0f}MB）" for m in llamacpp.MODELS.values()))
+            return 2
+        print(f"下载 {spec.name}（约 {spec.size_mb:.0f} MB）…")
+        print(f"  {spec.note}")
+        try:
+            p = llamacpp.download_model(
+                spec, force=args.force, on_progress=lambda x: print(_fmt_progress(x), end="")
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"\n✗ 下载失败：{e}")
+            return 1
+        print(f"\n✓ {p}（{p.stat().st_size / 1024 / 1024:.0f} MB）")
+
+    # -- 状态 -------------------------------------------------------------- #
+    if args.status or args.install or args.download:
+        print("\n--- 小模型层状态 ---")
+        deps = build_llm_status(cfg)
+        for line in deps:
+            print(line)
+
+    if args.install or args.download:
+        if not (args.text or args.probe):
+            return 0
+
+    # -- 探测 + 试句子 ----------------------------------------------------- #
+    client = make_client(lc)
+    if client is None:
+        print("· 造不出小模型客户端（配置里的 backend 有问题？）")
+        return 2
+
+    print(f"探测：{client.describe()}")
+    if not client.probe(force=True):
+        err = getattr(client, "last_error", "")
+        print(f"✗ 不可用：{err}")
+        if backend == "server":
+            print(f"  这个地址上没有 OpenAI 兼容服务：{lc.endpoint}")
+            print("  LM Studio：打开本地服务（默认 1234）；Ollama：ollama serve（11434）")
+            print("  或者改用内置的：voice-ctl llm --backend local --install --download --probe")
+        else:
+            print("  内置后端需要两步：voice-ctl llm --install  然后  voice-ctl llm --download")
+        client.close()
         return 1
-    print(f"✓ 服务可用，模型：{ex.model or '(服务没报模型名)'}")
-    if args.probe:
+    print(f"✓ {client.describe()}")
+    if args.probe and not args.text:
+        client.close()
         return 0
 
     texts = list(args.text)
@@ -372,21 +447,56 @@ def cmd_llm(args: argparse.Namespace) -> int:
             texts = ["有个文件要改一下", "把声音关小一点", "算个数", "随便说点什么"]
             print("（没给文本，用内置样例）")
 
-    cands = candidate_actions(cfg.enabled_actions, args.candidates)
+    cands = candidate_actions(cfg.enabled_actions, args.candidates or lc.max_candidates)
     print(f"候选 {len(cands)} 个（[llm].max_candidates 控制）：{', '.join(c[0] for c in cands)}")
     rc = 0
     for t in texts:
-        s = ex.suggest(t, cands)
+        s = client.suggest(t, cands)
         if s is None:
-            print(f"\n「{t}」→ 没拿到结果（{ex.last_error or '输出解析不了'}）")
+            print(f"\n「{t}」→ 没拿到结果（{getattr(client, 'last_error', '') or '输出解析不了'}）")
             rc = 1
             continue
         verdict = s.action_id or "(null：它认为候选里没有合适的)"
         known = "" if s.action_id is None or s.action_id in {c[0] for c in cands} else "  ← 编的，会被忽略"
         print(f"\n「{t}」→ {verdict}{known}   {s.ms:.0f}ms")
-        if s.title:
-            print(f"    标题：{s.title}")
+        if s.raw and s.raw != (s.action_id or ""):
+            print(f"    原始输出：{s.raw!r}")
+    client.close()
     return rc
+
+
+def build_llm_status(cfg) -> list[str]:  # noqa: ANN001 - AppConfig
+    """小模型层的就绪状态。doctor 和 `llm --status` 共用，避免两处说法不一致。"""
+    from . import llamacpp
+
+    out: list[str] = []
+    lc = cfg.llm
+    out.append(f"后端       : {lc.backend}"
+               + ("（内置 llama.cpp，不需要外部软件）" if lc.backend == "local" else f"  {lc.endpoint}"))
+    if lc.backend == "server":
+        out.append("外部服务   : 由你自己启动，本程序不管理它的进程")
+        return out
+
+    rt = llamacpp.default_runtime_dir()
+    if llamacpp.server_ready(rt):
+        n = len(list(rt.iterdir()))
+        size = sum(f.stat().st_size for f in rt.iterdir() if f.is_file()) / 1024 / 1024
+        out.append(f"运行时     : ✓ {rt}（{n} 个文件 {size:.1f} MB）")
+    else:
+        out.append(f"运行时     : ✗ 没装（{rt}）")
+        out.append("             装：voice-ctl llm --install   （约 17.7MB 下载 / 39.8MB 磁盘）")
+
+    m = llamacpp.find_model(lc.model)
+    if m is not None:
+        out.append(f"模型       : ✓ {m.name}（{m.stat().st_size / 1024 / 1024:.0f} MB）")
+    else:
+        spec = llamacpp.MODELS.get(lc.model, llamacpp.QWEN_05B)
+        out.append(f"模型       : ✗ 没下（配置里要的是 {lc.model}）")
+        out.append(f"             下：voice-ctl llm --download {spec.name}   （约 {spec.size_mb:.0f}MB）")
+    out.append(f"配置       : {'开启' if lc.enabled else '关闭'}（[llm].enabled）")
+    if llamacpp.server_ready(rt) and m is not None and not lc.enabled:
+        out.append("             都装好了，把 [llm].enabled 改成 true 就能用")
+    return out
 
 
 def cmd_schedule(args: argparse.Namespace) -> int:
@@ -697,13 +807,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--clear", action="store_true", help="清掉已提醒/已错过/已取消的")
     sp.set_defaults(func=cmd_schedule)
 
-    sp = sub.add_parser("llm", help="探测本机大模型服务，并让它试着挑动作（可选功能）")
+    sp = sub.add_parser("llm", help="本地小模型层：安装 / 下载模型 / 探测 / 试句子（可选功能）")
     sp.add_argument("text", nargs="*", help="要试的句子；留空则从 stdin 读或用内置样例")
-    sp.add_argument("--endpoint", default=None, help="覆盖 [llm].endpoint")
+    sp.add_argument("--install", action="store_true", help="下载并安装内置 llama.cpp 运行时（约 17.7MB）")
+    sp.add_argument(
+        "--download", nargs="?", const=True, default=None, metavar="MODEL",
+        help="下载 GGUF 模型；不给名字就用配置里的（默认 qwen2.5-0.5b-instruct，469MB）",
+    )
+    sp.add_argument("--status", action="store_true", help="只看就绪状态，不下载也不探测")
+    sp.add_argument("--force", action="store_true", help="已存在也重新下载")
+    sp.add_argument("--backend", default=None, choices=["local", "server"], help="覆盖 [llm].backend")
+    sp.add_argument("--endpoint", default=None, help="覆盖 [llm].endpoint（backend=server 时）")
     sp.add_argument("--model", default=None, help="覆盖 [llm].model")
-    sp.add_argument("--timeout", type=float, default=None, help="单次请求超时秒数")
-    sp.add_argument("--candidates", type=int, default=12, help="给模型看几个候选动作")
-    sp.add_argument("--probe", action="store_true", help="只探测服务，不试句子")
+    sp.add_argument("--candidates", type=int, default=0, help="给模型看几个候选动作")
+    sp.add_argument("--probe", action="store_true", help="只探测，不试句子")
     sp.set_defaults(func=cmd_llm)
 
     sp = sub.add_parser("record", help="录一段音频存成 wav")

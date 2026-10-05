@@ -152,21 +152,18 @@ def build_runtime(
             )
             decider = None
 
-    # 小模型层（可选）。探测失败只记一条日志——没装 LM Studio/Ollama 是常态，
-    # 不该在界面上刷一堆警告。
+    # 小模型层（可选）。**只造对象，不启动进程**——用户开着这一层却整场没说过
+    # 一句长尾话时，不该多一个常驻的 llama-server。
     llm = None
     if cfg.llm.enabled:
-        from .llm import SlotExtractor
+        from .llm import make_client
 
-        llm = SlotExtractor(
-            cfg.llm.endpoint, cfg.llm.model, timeout=cfg.llm.timeout,
-        )
-        if not llm.probe():
+        llm = make_client(cfg.llm)
+        if llm is not None and not llm.probe():
             (bus or events.get_bus()).emit(
-                "warn", f"小模型层开启但服务连不上，本句起回落到前几层：{llm.last_error}",
+                "warn", f"小模型层开启但还不可用，本句起回落到前几层：{getattr(llm, 'last_error', '')}",
                 kind="llm",
             )
-            llm = None
 
     return Runtime(cfg, norm, matcher, registry, asr, decider, app_index, llm)
 
@@ -593,6 +590,13 @@ class Engine:
             w.join(timeout=1.0)
         with self._lock:
             self._worker = None
+        # 先收小模型（可能起了一个 llama-server），再收提醒线程
+        pipe, self._pipe = self._pipe, None
+        if pipe is not None:
+            try:
+                pipe.close()
+            except Exception:  # noqa: BLE001
+                pass
         if self.cfg.schedule.enabled:
             from . import reminder
 

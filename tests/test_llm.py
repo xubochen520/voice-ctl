@@ -20,9 +20,12 @@ import pytest
 from voice_ctl.config import ActionConfig, AppConfig
 from voice_ctl.llm import (
     DEFAULT_ENDPOINT,
+    META_ACTIONS,
     SlotExtractor,
+    build_grammar,
     build_prompt,
     candidate_actions,
+    parse_index,
     parse_reply,
 )
 
@@ -95,10 +98,87 @@ def test_candidate_actions_falls_back_to_aliases():
     assert candidate_actions([a]) == [("x.y", "甲、乙")]
 
 
-def test_prompt_contains_the_candidates_and_the_sentence():
+def test_candidate_actions_hides_pipeline_actions():
+    """`open.target` / `sys.close_app` / `schedule` 这类不该给模型看。
+
+    它们没有固定目标——要开谁、关谁、什么时候提醒，得先由意图层解析出对象和时间。
+    摆进候选里模型没法判断「算个数」该不该选 `open.target`；实测更糟的是它会
+    **挤掉** `open.calc` 这种真正带名字的候选（候选按配置顺序取前 N 个，
+    `open.target` 恰好排在第一位）。
+    """
+    actions = [
+        ActionConfig(id="open.target", handler="open_target", aliases=["打开应用"]),
+        ActionConfig(id="schedule", handler="schedule", aliases=["日程", "提醒"]),
+        ActionConfig(id="sys.close_app", handler="close_app", aliases=["关闭应用"]),
+        ActionConfig(id="open.calc", handler="open_app", aliases=["计算器"], describe="打开计算器"),
+    ]
+    ids = [c[0] for c in candidate_actions(actions)]
+    assert ids == ["open.calc"], ids
+    assert not (set(ids) & META_ACTIONS)
+
+
+def test_candidate_actions_prefers_actions_with_real_aliases():
+    """有具体别名的排前面。只写了个泛泛描述的动作不该占满候选名额。"""
+    actions = [
+        ActionConfig(id="a.generic", handler="open_app", aliases=[], describe="做点什么"),
+        ActionConfig(id="b.specific", handler="open_app", aliases=["计算器"], describe="打开计算器"),
+    ]
+    assert [c[0] for c in candidate_actions(actions)] == ["b.specific", "a.generic"]
+
+
+def test_prompt_numbers_the_candidates_and_carries_the_sentence():
+    """候选写成**编号**清单，不写动作 id。
+
+    id 是 `sys.volume_down` 这种带点带下划线的串，0.5B 模型经常吐得不准；
+    一个数字它对得准。编号到 id 的映射在我们这边做。
+    """
     p = build_prompt("有个文件要改一下", candidate_actions(ACTIONS))
-    assert "open.notepad" in p and "打开记事本写字" in p
+    assert "1. 打开记事本写字" in p and "2. 打开计算器" in p
     assert "有个文件要改一下" in p
+    assert "open.notepad" not in p, "id 不进提示词，只进我们的映射表"
+
+
+# --------------------------------------------------------------------------- #
+# GBNF 语法约束：这一层唯一真正的安全保证
+# --------------------------------------------------------------------------- #
+
+
+def test_grammar_only_allows_the_candidate_numbers():
+    """语法里只出现 1..n 和 null。
+
+    这不是"提示词里请它别乱说"，而是解码时按语法剪枝——模型**结构上不可能**
+    输出候选之外的编号。整层的安全性就建在这上面。
+    """
+    g = build_grammar(3)
+    assert g == 'root ::= "1" | "2" | "3" | "null"'
+    assert '"4"' not in g
+
+
+def test_grammar_scales_to_the_candidate_count():
+    g = build_grammar(12)
+    for i in range(1, 13):
+        assert f'"{i}"' in g
+    assert '"13"' not in g
+
+
+@pytest.mark.parametrize(
+    ("raw", "n", "want"),
+    [
+        ("2", 5, 1),          # 1-based 编号 → 0-based 下标
+        (" 2 ", 5, 1),
+        ("2.", 5, 1),         # 小模型爱加个句号
+        ("编号2", 5, 1),
+        ('"3"', 5, 2),
+        ("null", 5, None),    # "候选里没有合适的"
+        ("NULL", 5, None),
+        ("", 5, None),
+        ("我不知道", 5, None),
+        ("9", 5, None),       # 超出候选范围
+        ("0", 5, None),
+    ],
+)
+def test_parse_index_is_tolerant_and_bounded(raw: str, n: int, want: int | None):
+    assert parse_index(raw, n) == want
 
 
 # --------------------------------------------------------------------------- #
@@ -236,13 +316,43 @@ def test_llm_config_rejects_nonsense(tmp_path: Path):
 
     p = tmp_path / "c.toml"
     p.write_text(
-        '[llm]\nenabled = true\nendpoint = ""\n\n'
+        '[llm]\nenabled = true\nbackend = "server"\nendpoint = ""\n\n'
         '[[action]]\nid = "a"\nhandler = "open_app"\n'
         'aliases = ["记事本"]\ntarget = "notepad.exe"\n',
         encoding="utf-8",
     )
     with pytest.raises(ConfigError, match="endpoint"):
         load_config(p)
+
+
+def test_llm_config_rejects_an_unknown_backend(tmp_path: Path):
+    """拼错 backend 时要说出来，不能静默退回内置——那会让用户以为在用自己的服务。"""
+    from voice_ctl.config import ConfigError, load_config
+
+    p = tmp_path / "c.toml"
+    p.write_text(
+        '[llm]\nbackend = "llama.cpp"\n\n'
+        '[[action]]\nid = "a"\nhandler = "open_app"\n'
+        'aliases = ["记事本"]\ntarget = "notepad.exe"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="backend"):
+        load_config(p)
+
+
+def test_local_backend_does_not_need_an_endpoint(tmp_path: Path):
+    """内置后端不用 endpoint —— 那是外部后端才需要的。"""
+    from voice_ctl.config import load_config
+
+    p = tmp_path / "c.toml"
+    p.write_text(
+        '[llm]\nenabled = true\nbackend = "local"\nendpoint = ""\n\n'
+        '[[action]]\nid = "a"\nhandler = "open_app"\n'
+        'aliases = ["记事本"]\ntarget = "notepad.exe"\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(p)
+    assert cfg.llm.enabled and cfg.llm.backend == "local"
 
 
 def test_real_config_parses_the_llm_section():

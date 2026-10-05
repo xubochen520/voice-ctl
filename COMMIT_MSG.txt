@@ -1,0 +1,43 @@
+0.3.1：内置 llama.cpp —— 小模型层不再依赖外部软件
+
+0.3.0 把小模型层做成了"客户端"：它假设用户自己在跑 LM Studio 或 Ollama。
+用户的原话是「直接内置 llama.cpp 不就好了，打包整个应用」，这一版把另一半补上。
+
+新增
+- llamacpp.py：llama.cpp 运行时的下载/解压/进程管理/模型下载
+    * 从官方 release 取 win-cpu-x64 包，只解压能跑 llama-server 的**最小集**
+      （22 个文件 39.8MB；整个 zip 解压出来 120MB+，六成是永远用不上的
+      bench/quantize/多模态 exe 和 impl.dll）
+    * 这 22 个是逐个删掉再跑 `llama-server --version` 试出来的下限——包括看着
+      像多模态才用的 mtmd.dll，少一个是 0xC0000135，报错完全不指向真因
+    * 15 个 ggml-cpu-*.dll 一个都不能少：ggml 按 CPU 指令集动态挑一个加载
+    * 子进程懒启动 + 显式 stop；端口不写死 8080（那是 llama.cpp 自己的默认值）
+- llm.py 重构：两种后端（local 内置 / server 外部）共用一个接口
+    * **GBNF 语法约束**：解码时只允许输出候选编号或 null，模型**结构上不可能**
+      编造动作。实测 20 次无关输入一次都没越界
+    * 候选改成编号清单（动作 id 带点带下划线，小模型吐不准）
+    * 过滤掉 open.target / sys.close_app / schedule 这类"管道"动作——它们没有
+      固定目标，喂给模型只会挤掉真正带名字的候选
+- CLI：voice-ctl llm --install / --download / --status / --probe
+- spec：VOICE_CTL_BUNDLE_LLAMA / VOICE_CTL_BUNDLE_LLM_MODEL 两个打包开关
+
+实测这个档位的能力边界（10 条用例 = 6 条该命中 + 4 条负样本）
+    qwen2.5-0.5b Q4_K_M  469MB  加载 0.7s  单次  90ms  该命中 0/6  误触发 0/4
+    qwen3-0.6b   Q8_0    610MB  加载 0.9s  单次 199ms  该命中 0/6  误触发 0/4
+    qwen2.5-1.5b Q4_K_M 1.0GB  加载 1.4s  单次 110ms  该命中 6/6  误触发 0/4
+
+ 0.5B/0.6B 档位**几乎只会答 null**：不误触发，但也帮不上忙。这条写进了
+ README、config.toml 的注释和发布说明——选型时最该知道的就是它。
+ 真想让它干活要用 1.5B；已经开了 Laya 语义层的话，这一层能补的很有限。
+
+为什么是 CPU 版：llama.cpp 的 Windows 构建里**没有 Vulkan**（只有 CPU / CUDA /
+OpenVINO / SYCL / ROCm），而这个项目的前提是"无 GPU"。CPU 版自带全套
+ggml-cpu-*.dll，从 Sandy Bridge 到最新机器都能跑，用户不用挑。
+
+为什么不把 GGUF 打进 exe：PyInstaller 单文件 exe **每次启动都要解包内嵌数据**。
+0.2.0 实测 226MB 的识别模型让启动从 1.7s 变 3.1s；469MB 只会更糟，而且是每次
+启动都白写一遍。让用户下一次更划算。运行时那 39.8MB 值得打进去。
+
+其它
+- 内置小模型层不引入任何 Python 依赖（标准库 urllib + llama.cpp 二进制）
+- 944 个单测通过（0.3.0 是 904 个），1 个非 Windows 跳过

@@ -96,28 +96,48 @@ data_file = ""
 remind_before = 0
 
 [llm]
-# 可选的小模型层：用**本机跑着的大模型服务**兜住前几层读不懂的长尾。
+# 可选的小模型层：用**本地跑着的大模型**兜住前几层读不懂的长尾。
 #
 #   「有个文件要改一下」  想开记事本，但一个名字都没提
 #   「把声音关小」        想调音量
 #
 # 它排在意图层、别名匹配、动态应用词典**之后**，只在前几层都没结果时才被调用。
-# 模型只做一件事：在候选动作里挑一个（返回 JSON 里的 action_id）。时间由
-# timeparse 解析、动作由注册表执行——模型没有"执行"这个字段可以填。
+# 模型只做一件事：在候选动作里挑一个。时间由 timeparse 解析、动作由注册表执行
+# ——模型没有"执行"这个字段可以填。
 #
-# 开之前：
-#   1. 启动本机服务。LM Studio 打开本地服务（默认 127.0.0.1:1234）；
-#      Ollama 用 ollama serve 并把 endpoint 改成 http://127.0.0.1:11434/v1
-#   2. voice-ctl llm --probe          确认能连上、报出模型名
-#   3. voice-ctl llm "有个文件要改一下"  看它建议哪个动作
-#   4. 改 enabled = true
+# 两种后端：
+#   local   内置 llama.cpp（默认）。自己下 llama-server + 一个小 GGUF 模型，
+#           打包后的应用**不需要任何外部软件**。两步：
+#               voice-ctl llm --install     下 llama.cpp 运行时（17.7MB 下载 / 39.8MB 磁盘）
+#               voice-ctl llm --download    下模型（默认 0.5B，469MB）
+#           llama.cpp 的 Windows 构建没有 Vulkan（只有 CPU/CUDA/OpenVINO/SYCL/ROCm），
+#           所以取的是 CPU 版；它带一整套 ggml-cpu-*.dll，按 CPU 指令集自动挑一个，
+#           从 Sandy Bridge 到最新的机器都能跑。
+#   server  接一个已经在跑的服务（LM Studio 1234 / Ollama 11434 / llama.cpp 自己起的）。
+#           endpoint 改一下就行，两家都是 OpenAI 的 /chat/completions 协议。
 #
-# 服务连不上只会静默退回前几层，不会让助手失效——所以开着是安全的，
-# 代价只是每句长尾指令多等一次 HTTP 往返。
+# ⚠ 实测（这台 i7-13650HX，CPU 推理，10 条用例 = 6 条真该命中 + 4 条负样本）：
+#
+#     模型                        加载     单次     真该命中   负样本误触发
+#     qwen2.5-0.5b Q4_K_M        0.7s    90ms     0/6        0/4
+#     qwen3-0.6b Q8_0            0.9s   199ms     0/6        0/4
+#     qwen2.5-1.5b Q4_K_M        1.4s   110ms     6/6        0/4
+#
+#   0.5B/0.6B 档位**几乎只会答 null**：不误触发，但也帮不上忙。真想让它干活，
+#   用 1.5B（约 1GB）：model = "qwen2.5-1.5b-instruct"。
+#   已经开了 Laya 语义层（[decision]，20 选项实测 6/6）的话，这一层能补的很有限。
+#
+# 输出用 GBNF 语法锁死（只允许输出候选编号或 null），所以模型**结构上不可能**
+# 编出一个不存在的动作——实测 20 次无关输入一次都没越界。
 enabled = false
-endpoint = "http://127.0.0.1:1234/v1"
-model = ""                 # 留空 = 用服务上加载的第一个模型
-timeout = 4.0              # 单次推理超时（秒）
+backend = "local"
+endpoint = "http://127.0.0.1:1234/v1"    # backend = "server" 时用
+model = "qwen2.5-0.5b-instruct"          # MODELS 里的名字，或模型目录里任意 .gguf
+timeout = 4.0              # 外部服务单次请求超时（秒）
+request_timeout = 30.0     # 内置 llama.cpp 单次请求超时（秒）
+ctx_size = 2048            # 内置 llama.cpp 的上下文长度；抽槽位用不了这么长
+threads = 0                # 0 = 自动（CPU 核数的一半）
+startup_timeout = 60.0     # 等 llama-server 就绪的上限（秒）
 max_candidates = 12        # 给模型看几个候选；越多它越容易乱挑
 
 # --------------------------------------------------------------------------- #

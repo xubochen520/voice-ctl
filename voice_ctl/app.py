@@ -147,6 +147,21 @@ class Pipeline:
     def now(self) -> datetime:
         return self._clock() if self._clock else datetime.now()
 
+    def close(self) -> None:
+        """收掉小模型层起的子进程。
+
+        内置 llama.cpp 会在第一次推理时起一个 llama-server。**不显式收掉的话，
+        它会活到用户重启**——一个占着几百 MB 内存、在 127.0.0.1 上监听的孤儿
+        进程，比这个功能不存在更糟。
+        """
+        if self.llm is not None:
+            close = getattr(self.llm, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001 - 收尾失败不该影响退出
+                    pass
+
     # -- 各阶段 ----------------------------------------------------------- #
 
     def transcribe(self, samples, timing: StageTiming, sample_rate: int = 16000) -> AsrResult:

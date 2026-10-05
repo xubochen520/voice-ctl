@@ -16,6 +16,30 @@
 
 ---
 
+## 0.3.1：内置 llama.cpp
+
+0.3.0 把小模型层做成了"客户端"——它假设用户自己在跑 LM Studio 或 Ollama。
+这一版把另一半补齐：**应用自己带 llama.cpp**，不需要装任何外部软件。
+
+```powershell
+voice-ctl llm --install      # llama.cpp 运行时：17.7MB 下载 / 39.8MB 磁盘
+voice-ctl llm --download     # 模型：默认 0.5B，469MB
+voice-ctl llm "有个文件要改一下"
+```
+
+⚠ **实测这个档位的能力边界**（10 条用例 = 6 条该命中 + 4 条负样本）：
+
+| 模型 | 加载 | 单次 | 该命中 | 负样本误触发 |
+|---|---|---|---|---|
+| qwen2.5-0.5b Q4_K_M（469MB） | 0.7s | 90ms | 0/6 | 0/4 |
+| qwen3-0.6b Q8_0（610MB） | 0.9s | 199ms | 0/6 | 0/4 |
+| qwen2.5-1.5b Q4_K_M（1GB） | 1.4s | 110ms | **6/6** | 0/4 |
+
+0.5B/0.6B **几乎只会答 `null`**——不误触发，但也帮不上忙。真想让它干活用
+`model = "qwen2.5-1.5b-instruct"`。细节见下面「④ 小模型层」。
+
+---
+
 ## 0.3.0：从「匹配别名」到「理解句子」
 
 0.2.0 的判定模型是一句话：**话里出现了某个别名，就执行那个动作**。它对
@@ -106,20 +130,65 @@ voice-ctl schedule --clear                      # 清掉已提醒/已错过的
 前三层覆盖的是"说得清楚"的指令。剩下的长尾是**缺字**：「有个文件要改一下」
 （想开记事本）、「把声音关小」（想调音量）——这些用通用大模型补比训练分类器合适。
 
+这一层**内置 llama.cpp**，不需要用户装任何外部软件：
+
 ```powershell
-# 先启动本机服务：LM Studio 打开本地服务（默认 1234）；Ollama 用 11434
-voice-ctl llm --probe                  # 探测：连得上吗、模型是哪个
-voice-ctl llm "有个文件要改一下"        # 看它建议哪个动作、花多久
+voice-ctl llm --install            # llama.cpp 运行时：17.7MB 下载 / 39.8MB 磁盘
+voice-ctl llm --download           # 模型：默认 0.5B，469MB
+voice-ctl llm --status             # 看看齐了没
+voice-ctl llm "有个文件要改一下"    # 试一句，看它挑谁、花多久
 # 满意了再把 config.toml 的 [llm].enabled 改成 true
 ```
 
-三条刻意的约束，都是为了让"可选"真的是可选：
+想接已经在跑的服务（LM Studio / Ollama）也行：`backend = "server"` +
+`endpoint = "http://127.0.0.1:11434/v1"`。两家都是 OpenAI 的 `/chat/completions`
+协议，所以同一份代码通吃。
 
-1. **只抽槽位，不执行**。模型返回的 JSON 里只有候选动作的 id 和标题；
-   时间由代码解析、动作由注册表执行。模型**没有**"执行"这个字段可以填。
-2. **服务连不上等于功能不存在**，而不是功能报错。静默退回前三层，
-   日志留一行——没装 LM Studio 是常态，不该因此让助手失效。
-3. **编出来的 action_id 绝不执行**。它只有建议权；注册表才是决定权。
+#### 实测：这个模型档位能不能用
+
+这台机器（i7-13650HX，CPU 推理）。10 条用例 = 6 条真该命中 + 4 条负样本：
+
+| 模型 | 加载 | 单次 | 真该命中 | 负样本误触发 |
+|---|---|---|---|---|
+| qwen2.5-0.5b Q4_K_M（469MB） | 0.7s | 90ms | **0/6** | 0/4 |
+| qwen3-0.6b Q8_0（610MB） | 0.9s | 199ms | **0/6** | 0/4 |
+| qwen2.5-1.5b Q4_K_M（1GB） | 1.4s | 110ms | **6/6** | 0/4 |
+
+**0.5B/0.6B 档位几乎只会答 `null`**：不误触发，但也帮不上忙。我把它留作默认
+下载项，是因为它 90ms、不占内存，当"多一道确认"用没有坏处；**真想让它干活得用
+1.5B**（`model = "qwen2.5-1.5b-instruct"`）。
+
+如果你已经开了 Laya 语义层（`[decision]`，20 选项下实测 6/6），这一层能补的
+很有限——它的价值在"补充"而不是"替代"，以及给不想背 900MB Laya 权重、
+想要一个能换模型的通用文本模型的人。
+
+#### 为什么它不可能编造动作
+
+这一层唯一的真实危险是模型吐出一个不存在的动作 id。两道锁：
+
+1. **GBNF 语法约束**。llama.cpp 解码时按语法剪枝，只允许输出候选编号或 `null`
+   ——模型**结构上不可能**越界。实测 20 次八竿子打不着的输入，一次都没越界。
+   这不是"在提示词里求它别乱说"能比的。
+2. **注册表校验**。即便没有语法（外部服务走的是普通 JSON），回来的 id 也必须
+   在注册表里，否则丢弃并说出来。
+
+还有三条刻意的约束：
+
+- **只抽槽位，不执行**。模型能填的只有"选第几个候选"；时间由代码解析、
+  动作由注册表执行。模型说"打开 rm -rf /"没有意义，它没有那个字段可填。
+- **只在前面几层都没结果时才被调用**。为一句「打开微信」等一次推理是荒唐的。
+- **不可用等于功能不存在**。没下模型、没装运行时都是常态，探测失败就静默
+  退回前三层，日志留一行——绝不让助手因此无法执行本来能执行的指令。
+
+为什么是 **CPU 版**：llama.cpp 的 Windows 构建里**没有 Vulkan**（只有 CPU /
+CUDA / OpenVINO / SYCL / ROCm），而这个项目的前提是"无 GPU"。CPU 版还带一整套
+`ggml-cpu-*.dll`（haswell / zen4 / sapphirerapids…），运行时按 CPU 指令集自动挑
+一个，所以同一个包从 Sandy Bridge 到最新的机器都能跑，用户不用挑。
+
+为什么只解压 **39.8MB**：完整的 zip 解压出来 120MB+，其中六成是 bench / quantize /
+多模态那些永远用不上的 exe 和 impl.dll。留下的 22 个文件是逐个删掉再跑
+`llama-server --version` 试出来的下限——包括看着像多模态才用的 `mtmd.dll`，
+少了它直接 `0xC0000135`（DLL 找不到），而那个报错完全不指向真因。
 
 只用标准库 `urllib`，不引入 openai 包——这一层不该给整个项目加运行时依赖。
 
@@ -234,7 +303,7 @@ voice-ctl run
 | `devices` | 列出可用麦克风（把序号填进 `[audio].device`） |
 | `download` | 下载 SenseVoice 识别模型（约 226MB，必做） |
 | `fetch-decision` | 下载 Laya 语义层 ONNX 权重（约 900MB，可选） |
-| `llm` | 探测本机大模型服务并试挑动作（可选）；`--probe` 只探测 |
+| `llm` | 本地小模型层：`--install` 装内置 llama.cpp、`--download` 下模型、`--status` 看状态、给句子试挑动作 |
 | `schedule` | 看 / 导出 / 清理日程提醒；`--export x.ics` 导出日历 |
 | `test` | 用自带样例音频验证识别能跑通 |
 | `simulate <文本...>` | **不开麦克风**，直接测「意图 → 匹配 → 执行」；`--now` 可固定"现在" |
@@ -550,7 +619,7 @@ voice-ctl simulate "你说的话" --dry-run
 
 ```powershell
 .venv\Scripts\pip install -e ".[dev]"
-.venv\Scripts\python -m pytest                      # 904 个单测，约 42 秒（含真实建窗的界面冒烟测试）
+.venv\Scripts\python -m pytest                      # 943 个单测，约 39 秒（含真实建窗的界面冒烟测试）
 .venv\Scripts\python scripts\bench_e2e.py           # 端到端基准（需先 make_tts_samples.py）
 .venv\Scripts\python scripts\probe_decision.py      # 语义层实测（需先 fetch-decision）
 .venv\Scripts\python scripts\diag_appfind.py        # 应用定位排障：逐级打印找没找到
@@ -598,7 +667,8 @@ voice_ctl/
 ├── schedule.py    日程存储 + .ics 导出 + 到点提醒线程
 ├── reminder.py    把提醒线程和"用户能感知的通知"接起来
 ├── decision.py    语义决策（Laya ONNX，可选）
-├── llm.py         小模型层（本机大模型服务，可选，只抽槽位）
+├── llm.py         小模型层：两种后端（内置 llama.cpp / 外部服务），GBNF 锁输出
+├── llamacpp.py    内置 llama.cpp：下运行时、管 llama-server 进程、下 GGUF 模型
 ├── singleton.py   单实例保护（避免两个进程抢热键）
 ├── autostart.py   开机自启（注册表 Run 项）
 ├── bootstrap.py   冻结/源码两种运行方式下的路径解析
@@ -620,7 +690,10 @@ pynput        全局热键
 numpy         音频处理
 ```
 
-可选：`pypinyin`（中文同音消歧，建议装）、`laya[onnx]`（第 1 层语义决策）。
+可选：`pypinyin`（中文同音消歧，建议装）、`laya[onnx]`（Laya 语义层）。
+
+**内置小模型层不引入任何 Python 依赖**——它用的是标准库 `urllib` 加一份
+llama.cpp 的二进制（39.8MB，`voice-ctl llm --install` 下载）。
 
 ## 许可
 

@@ -11,7 +11,7 @@
         → 意图层（动词/否定/时间/动态应用词典，约 1ms）
         → 别名匹配（约 1ms，与 0.2.0 行为一致）
         → 语义决策（Laya ONNX，可选，40-100ms）
-        → 小模型层（本机大模型服务，可选，数百 ms）
+        → 小模型层（内置 llama.cpp，可选，90-110ms）
         → 执行（日程 / 开关应用 / 系统操作 / 按键 / 命令）
 
 前两层不需要任何模型，覆盖绝大多数指令；后两层只在前面都没结果时才被调用。
@@ -19,6 +19,6 @@
 
 from .config import AppConfig, ConfigError, load_config
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = ["AppConfig", "ConfigError", "load_config", "__version__"]

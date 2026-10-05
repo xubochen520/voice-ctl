@@ -236,33 +236,72 @@ class ScheduleConfig:
 
 @dataclass
 class LLMConfig:
-    """可选的小模型层：用本机跑着的大模型服务兜住前几层的长尾（见 voice_ctl/llm.py）。
+    """可选的小模型层：用本地跑着的大模型兜住前几层的长尾（见 voice_ctl/llm.py）。
 
-    默认**关闭**，因为它依赖外部服务。开之前先确认服务在跑：
-        LM Studio：打开开发者模式里的本地服务（默认 127.0.0.1:1234）
-        Ollama  ：ollama serve，然后把 endpoint 改成 http://127.0.0.1:11434/v1
+    默认**关闭**，因为它要额外下 40MB 运行时 + 241MB~1GB 模型。
 
-    开之前建议先量一下它到底值不值：
-        voice-ctl llm --probe      （探测服务 + 报模型名）
-        voice-ctl llm "有个文件要改一下"   （看它建议哪个动作）
+    两种后端：
+
+        local（默认）  自己下 llama.cpp 的 llama-server 和一个小 GGUF 模型。
+                       打包后的应用**不需要任何外部软件**——这是内置的全部意义。
+        server         接一个已经在跑的服务（LM Studio 1234 / Ollama 11434）。
+
+    **实测（一台 i7-13650HX，CPU 推理，10 条用例里 6 条真该命中、4 条是负样本）**：
+
+        模型                        加载     单次      命中      负样本误触发
+        qwen2.5-0.5b Q4_K_M        0.7s    90ms     0/6       0/4
+        qwen3-0.6b Q8_0            0.9s   199ms     0/6       0/4
+        qwen2.5-1.5b Q4_K_M        1.4s   110ms     6/6       0/4
+
+    0.5B/0.6B 档位几乎只会答 null：**不误触发，但也帮不上忙**。真想让它干活，
+    用 1.5B（`model = "qwen2.5-1.5b-instruct"`，1GB）。
+    如果你已经开了 Laya 语义层（`[decision]`，20 选项下实测 6/6），这一层能补的
+    很有限——它的价值在"补充"而不是"替代"。
     """
 
     enabled: bool = False
+
+    backend: str = "local"
+    """local = 内置 llama.cpp；server = 外部 OpenAI 兼容服务。"""
+
     endpoint: str = "http://127.0.0.1:1234/v1"
-    model: str = ""
-    """留空 = 用服务上加载的第一个模型。"""
+    """backend = "server" 时的服务地址。Ollama 用 http://127.0.0.1:11434/v1。"""
+
+    model: str = "qwen2.5-0.5b-instruct"
+    """backend = "local"：MODELS 里的名字，或模型目录里任意 .gguf 的文件名。
+    backend = "server"：留空用服务上加载的第一个模型。"""
+
     timeout: float = 4.0
-    """单次推理超时（秒）。本机小模型通常 0.3-2 秒；超过 4 秒说明它在算别的。"""
+    """外部服务单次请求超时（秒）。本机小模型通常 0.3-2 秒；超过说明它在算别的。"""
+
+    request_timeout: float = 30.0
+    """内置 llama.cpp 单次请求超时（秒）。第一次请求要把模型读进内存，给宽一点。"""
+
+    ctx_size: int = 2048
+    """内置 llama.cpp 的上下文长度。抽槽位只要几百 token，不必给大。"""
+
+    threads: int = 0
+    """内置 llama.cpp 的线程数。0 = 自动（CPU 核数的一半）。"""
+
+    startup_timeout: float = 60.0
+    """等 llama-server 就绪的上限（秒）。冷盘上加载 1GB 模型可能要十几秒。"""
+
     max_candidates: int = 12
     """给模型看几个候选。它越多越容易乱挑（官方 20 选项任务只有 0.451）。"""
 
     def validate(self) -> None:
-        if self.timeout <= 0:
-            raise ConfigError("llm.timeout 必须大于 0")
+        if self.timeout <= 0 or self.request_timeout <= 0:
+            raise ConfigError("llm.timeout / llm.request_timeout 必须大于 0")
         if self.max_candidates < 1:
             raise ConfigError("llm.max_candidates 至少是 1")
-        if self.enabled and not self.endpoint.strip():
-            raise ConfigError("llm.enabled = true 时必须给出 endpoint")
+        if self.ctx_size < 256:
+            raise ConfigError("llm.ctx_size 太小了，至少 256")
+        if self.threads < 0:
+            raise ConfigError("llm.threads 不能是负数")
+        if self.backend not in ("local", "server"):
+            raise ConfigError(f"llm.backend 只支持 local / server，实际是 {self.backend!r}")
+        if self.enabled and self.backend == "server" and not self.endpoint.strip():
+            raise ConfigError("llm.backend = \"server\" 时必须给出 endpoint")
 
 
 @dataclass
