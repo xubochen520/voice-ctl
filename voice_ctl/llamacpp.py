@@ -125,6 +125,21 @@ def resolve_runtime_dir() -> Path:
     return cands[0]
 
 
+def is_bundled_runtime(path: Path) -> bool:
+    """这个目录是不是 exe 内嵌的那份。
+
+    用它而不是在调用处比较路径：内嵌那份在 `_MEIPASS` 里，路径每次启动都不一样
+    （`_MEI0000d0482` 这种随机后缀），拿它和别的路径做相等的写法迟早出错。
+    """
+    b = bootstrap.resource(BUNDLED_RUNTIME)
+    if b is None:
+        return False
+    try:
+        return Path(path).resolve() == Path(b).resolve()
+    except OSError:
+        return False
+
+
 def bundled_model() -> Path | None:
     """随 exe 内嵌的 GGUF（`VOICE_CTL_BUNDLE_LLM_MODEL=1`）。"""
     d = bootstrap.resource("llm-models")
@@ -554,6 +569,7 @@ __all__ = [
     "find_free_port",
     "find_model",
     "install_runtime",
+    "is_bundled_runtime",
     "model_dir",
     "resolve_runtime_dir",
     "runtime_candidates",

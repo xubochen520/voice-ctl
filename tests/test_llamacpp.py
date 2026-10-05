@@ -179,6 +179,56 @@ def test_bundled_runtime_is_used_when_the_user_has_none(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="这条测的是非 Windows 上的明确拒绝")
+def test_bundled_runtime_is_reported_as_present_not_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """`llm --status` 不许把一个**自带 llama.cpp 的 exe** 说成"没装"。
+
+    回归：状态展示当初走的是 `default_runtime_dir()`（数据目录），而查找走的是
+    `resolve_runtime_dir()`（数据目录 + 内嵌）。表现是打包后 `--status` 报
+    "运行时 ✗ 没装，去下 17.7MB"，可它就在 exe 里躺着——用户会照着提示白下一次。
+    """
+    from dataclasses import replace
+
+    from voice_ctl.cli import build_llm_status
+    from voice_ctl.config import AppConfig, LLMConfig, load_config
+
+    monkeypatch.setenv("VOICE_CTL_DATA", str(tmp_path / "data"))
+    bundled = tmp_path / "bundle" / llamacpp.BUNDLED_RUNTIME
+    bundled.mkdir(parents=True)
+    (bundled / "llama-server.exe").write_bytes(b"x")
+    (bundled / "ggml-cpu-x64.dll").write_bytes(b"x")
+    monkeypatch.setenv("VOICE_CTL_HOME", str(tmp_path / "bundle"))
+
+    assert llamacpp.is_bundled_runtime(bundled) is True
+    assert llamacpp.is_bundled_runtime(tmp_path / "other") is False
+
+    root = Path(__file__).resolve().parent.parent
+    cfg = replace(load_config(root / "config.toml"), llm=LLMConfig(enabled=False))
+    text = "\n".join(build_llm_status(cfg))
+    assert "运行时     : ✓" in text and "exe 内嵌" in text, text
+    assert "--install" not in text, "已经内嵌了就不该再让用户去下"
+
+
+def test_status_lines_up_with_the_actual_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """什么都没装时，状态里给的提示要指向真的会被用的那个目录。"""
+    from voice_ctl.cli import build_llm_status
+    from voice_ctl.config import LLMConfig
+
+    monkeypatch.setenv("VOICE_CTL_DATA", str(tmp_path / "data"))
+    monkeypatch.setenv("VOICE_CTL_HOME", str(tmp_path / "nothing-here"))
+
+    class _Cfg:
+        llm = LLMConfig(enabled=False)
+
+    text = "\n".join(build_llm_status(_Cfg()))
+    assert "运行时     : ✗" in text
+    assert str(llamacpp.resolve_runtime_dir()) in text
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="这条测的是非 Windows 上的明确拒绝")
 def test_install_refuses_on_other_platforms(tmp_path: Path):
     with pytest.raises(RuntimeError, match="Windows"):
         llamacpp.install_runtime(target=tmp_path / "rt")

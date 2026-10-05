@@ -466,7 +466,13 @@ def cmd_llm(args: argparse.Namespace) -> int:
 
 
 def build_llm_status(cfg) -> list[str]:  # noqa: ANN001 - AppConfig
-    """小模型层的就绪状态。doctor 和 `llm --status` 共用，避免两处说法不一致。"""
+    """小模型层的就绪状态。doctor 和 `llm --status` 共用，避免两处说法不一致。
+
+    这里必须走 `resolve_runtime_dir()` 而不是 `default_runtime_dir()`：
+    打包时可以把运行时内嵌进 exe（`VOICE_CTL_BUNDLE_LLAMA=1`），那一份在
+    `_MEIPASS` 里。用默认目录判断的话，一个**自带 llama.cpp 的 exe** 会告诉
+    用户"没装，去下 17.7MB"——而它其实已经带了。
+    """
     from . import llamacpp
 
     out: list[str] = []
@@ -477,18 +483,21 @@ def build_llm_status(cfg) -> list[str]:  # noqa: ANN001 - AppConfig
         out.append("外部服务   : 由你自己启动，本程序不管理它的进程")
         return out
 
-    rt = llamacpp.default_runtime_dir()
+    rt = llamacpp.resolve_runtime_dir()
     if llamacpp.server_ready(rt):
         n = len(list(rt.iterdir()))
         size = sum(f.stat().st_size for f in rt.iterdir() if f.is_file()) / 1024 / 1024
-        out.append(f"运行时     : ✓ {rt}（{n} 个文件 {size:.1f} MB）")
+        where = "（exe 内嵌）" if llamacpp.is_bundled_runtime(rt) else ""
+        out.append(f"运行时     : ✓ {rt}{where}（{n} 个文件 {size:.1f} MB）")
     else:
         out.append(f"运行时     : ✗ 没装（{rt}）")
         out.append("             装：voice-ctl llm --install   （约 17.7MB 下载 / 39.8MB 磁盘）")
 
     m = llamacpp.find_model(lc.model)
     if m is not None:
-        out.append(f"模型       : ✓ {m.name}（{m.stat().st_size / 1024 / 1024:.0f} MB）")
+        bm = llamacpp.bundled_model()
+        where = "（exe 内嵌）" if bm is not None and m == bm else ""
+        out.append(f"模型       : ✓ {m.name}{where}（{m.stat().st_size / 1024 / 1024:.0f} MB）")
     else:
         spec = llamacpp.MODELS.get(lc.model, llamacpp.QWEN_05B)
         out.append(f"模型       : ✗ 没下（配置里要的是 {lc.model}）")

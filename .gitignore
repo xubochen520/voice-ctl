@@ -8,6 +8,10 @@ __pycache__/
 # 模型权重（226MB，用 `voice-ctl download` 拉取，不进版本库）
 models/
 
+# llama.cpp 运行时与本地小模型（用 `voice-ctl llm --install` / `--download` 拉取）
+# 39.8MB 的二进制；打包时由 voice-ctl.spec 收进 exe
+llm/
+
 # 打包产物（构建脚本重新生成，不进版本库）
 build/
 build-full/

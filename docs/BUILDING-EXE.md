@@ -4,27 +4,50 @@
 
 | 变体 | 体积 | 首次使用 | 启动耗时 | 适合谁 |
 |---|---|---|---|---|
-| **lite** | 54.9 MB | 需跑一次 `download`（226MB） | **1.6s** | 日常使用（模型放 exe 旁边，启动不解包） |
-| **full** | 206.9 MB | 开箱即用 | 3.0s | 想零配置、或不方便单独下模型 |
+| **lite** | 84.0 MB | 需跑一次 `download`（226MB） | **2.4s** | 日常使用（模型放 exe 旁边，启动不解包） |
+| **full** | 236.0 MB | 开箱即用 | 3.8s | 想零配置、或不方便单独下模型 |
 
-两者功能完全一致，只差模型是否内嵌。**常用建议选 lite**：虽然要多下一次，
+两者功能完全一致，只差识别模型是否内嵌。**常用建议选 lite**：虽然要多下一次，
 但每次启动快一倍——`full` 每次运行都要把 226MB 解包到临时目录。
+
+（0.3.1 起两个变体都内嵌了 39.8MB 的 llama.cpp 运行时，见下。）
 
 ## 构建
 
 ```powershell
 .venv\Scripts\pip install pyinstaller
 
-# 精简版
-.venv\Scripts\python -m PyInstaller voice-ctl.spec --noconfirm
+# 内置小模型层要先有 llama.cpp 运行时（39.8MB），不然 spec 会警告并跳过
+.venv\Scripts\voice-ctl llm --install
 
-# 完整版（内嵌模型）
-$env:VOICE_CTL_BUNDLE_MODEL='1'
-.venv\Scripts\python -m PyInstaller voice-ctl.spec --noconfirm --distpath dist-full
+# 精简版
+$env:VOICE_CTL_BUNDLE_LLAMA='1'
+.venv\Scripts\python -m PyInstaller voice-ctl.spec --noconfirm
+Remove-Item Env:\VOICE_CTL_BUNDLE_LLAMA
+
+# 完整版（内嵌识别模型）
+$env:VOICE_CTL_BUNDLE_MODEL='1'; $env:VOICE_CTL_BUNDLE_LLAMA='1'
+.venv\Scripts\python -m PyInstaller voice-ctl.spec --noconfirm --distpath dist-full --workpath build-full
 Remove-Item Env:\VOICE_CTL_BUNDLE_MODEL
 ```
 
 产物：`dist\voice-ctl.exe` / `dist-full\voice-ctl.exe`。
+
+## 三个打包开关
+
+| 环境变量 | 内容 | 建议 |
+|---|---|---|
+| `VOICE_CTL_BUNDLE_LLAMA` | 39.8MB llama.cpp 运行时 | **打**——它是"内置小模型层"的前提，而从 GitHub 下载要用户能访问 github.com |
+| `VOICE_CTL_BUNDLE_LLM_MODEL` | 469MB~1GB 的 GGUF 模型 | **别打**——单文件 exe 每次启动都要解包它 |
+| `VOICE_CTL_BUNDLE_MODEL` | 226MB 识别模型 | 看情况（`full` 变体就是它） |
+
+**为什么 GGUF 不该打进 exe**：PyInstaller 的单文件 exe 每次启动都把内嵌数据
+解包到临时目录。0.2.0 实测过这条路的代价——226MB 的识别模型让启动从 1.7s
+变成 3.1s。469MB 只会更糟，而且是**每次启动**都白写 469MB 到磁盘。
+让用户下一次，比每次启动都解包划算。
+
+**为什么运行时可以打**：内嵌的是 22 个 DLL，只有真的开出小模型层才会被加载。
+不开的话它们只是磁盘上的几行目录项。
 
 ## 打包后必须验证
 
@@ -48,7 +71,18 @@ Start-Process .\voice-ctl.exe -ArgumentList run -NoNewWindow
 # 然后在另一个窗口模拟按键，或直接手工按住 Ctrl+Alt+Space 说话
 ```
 
-## 三个必须显式处理的依赖
+再验一遍内嵌的 llama.cpp（`--selftest` 不覆盖这一块）：
+
+```powershell
+.\voice-ctl.exe llm --status     # 运行时那行要显示「（exe 内嵌）」
+```
+
+想连推理一起验，往 `llm\models\` 里放一个 gguf 再跑
+`.\voice-ctl.exe llm "算个数"`。**注意**内嵌的那份运行时在 `_MEIPASS`
+（每次启动路径都不同），所以 `--status` 里的路径长得像
+`...\Temp\_MEI0000c8482\llama-runtime`，这是对的。
+
+## 四个必须显式处理的依赖
 
 PyInstaller 的 import 分析抓不全这些，漏了就是运行时 ImportError 或设备打不开：
 
@@ -57,6 +91,9 @@ PyInstaller 的 import 分析抓不全这些，漏了就是运行时 ImportError
 2. **`_sounddevice_data/`** —— PortAudio 的 DLL 放在这个**独立顶层包**里，
    不在 `sounddevice` 包内，import 分析发现不了。用 `collect_data_files`。
 3. **模型与配置** —— 纯数据文件，手动加进 `datas`。
+4. **llama.cpp 的 22 个文件** —— 同理，而且**一个都不能少**。实测少一个
+   `mtmd.dll` 就是 `0xC0000135`（DLL 找不到），而那个报错完全不指向真因；
+   15 个 `ggml-cpu-*.dll` 也一个都不能删，ggml 按 CPU 指令集动态挑一个加载。
 
 ## 编码：打包后第一个会踩的坑
 
