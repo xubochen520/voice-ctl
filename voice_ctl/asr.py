@@ -23,6 +23,14 @@ import numpy as np
 SAMPLE_RATE = 16000
 """SenseVoice 固定要求 16kHz。"""
 
+DEFAULT_PAD_MS = 300
+"""识别前在波形头尾各补多少毫秒的静音。
+
+实测（TTS 合成的 8 句日程口令）：不补时「明天早上八点半提醒我开会」被识别成
+「天早上八点半…」，**首字「明」丢了**，补 200ms 以上后 8/8 全对。丢的字是随机的
+（补 100ms 时换成了另一句丢字），所以不是某个词的问题，是模型对"一上来就是
+语音"的开头不稳。日程场景里这个代价很高：「明天」变「今天」是错得很合理的错误。"""
+
 
 class AsrError(Exception):
     """识别失败。消息要说清是模型缺失、音频格式不对，还是别的。"""
@@ -103,14 +111,30 @@ class Asr:
         use_itn: bool = True,
         num_threads: int = 2,
         provider: str = "cpu",
+        pad_ms: int = DEFAULT_PAD_MS,
     ) -> None:
         self.model_dir = Path(model_dir).expanduser().resolve()
         self.language = language
         self.use_itn = use_itn
         self.num_threads = num_threads
         self.provider = provider
+        self.pad_ms = max(0, int(pad_ms))
         self._rec = None
         self.load_ms = 0.0
+
+    def same_model_as(self, other: "Asr") -> bool:
+        """加载出来的识别器是否可以互换。
+
+        配置热更新时用它决定要不要重新加载 226MB 的模型：只有这几项会改变
+        模型本身；`pad_ms` 只影响喂进去的波形，原地改就行，不算在内。
+        """
+        return (
+            self.model_dir == other.model_dir
+            and self.language == other.language
+            and self.use_itn == other.use_itn
+            and self.num_threads == other.num_threads
+            and self.provider == other.provider
+        )
 
     # -- 资源 ------------------------------------------------------------- #
 
@@ -164,6 +188,10 @@ class Asr:
 
         audio = np.ascontiguousarray(samples, dtype=np.float32)
         duration = len(audio) / SAMPLE_RATE
+        if self.pad_ms > 0 and audio.size:
+            # duration 记的是**原始**时长：RTF 要反映真实音频，不该被补的静音稀释
+            pad = np.zeros(SAMPLE_RATE * self.pad_ms // 1000, dtype=np.float32)
+            audio = np.concatenate([pad, audio, pad])
 
         t0 = time.perf_counter()
         stream = self._rec.create_stream()

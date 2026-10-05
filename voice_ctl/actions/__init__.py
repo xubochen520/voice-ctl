@@ -18,9 +18,10 @@ import time
 import webbrowser
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..appfind import resolve_app
+from ..apps import AppEntry
 
 # --------------------------------------------------------------------------- #
 # 基础设施
@@ -43,7 +44,7 @@ class ActionContext:
     """执行上下文。动作可以读它，但不应该改它。"""
 
     text: str = ""
-    """识别出的原始文本。"""
+    """识别出的**原始**文本（ASR 原文，没经过归一化）。"""
 
     normalized: str = ""
     """归一化后的文本。"""
@@ -53,6 +54,9 @@ class ActionContext:
 
     dry_run: bool = False
     """True 时只报告将要做什么，不真的执行。"""
+
+    slots: dict[str, Any] = field(default_factory=dict)
+    """从句式（`patterns`）里抓到的槽位，如 {"q": "天气"}。"""
 
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -98,11 +102,104 @@ def _popen(args: list[str], *, cwd: str | None = None) -> subprocess.Popen:
 # --------------------------------------------------------------------------- #
 
 
+class OpenTargetAction(Action):
+    """打开**运行时才确定**的应用（「打开QQ」里的 QQ）。
+
+    和 open_app 的区别只有一个：目标不是配置里写死的，而是意图层从已安装应用
+    索引里解析出来的，通过 `ctx.slots["app"]` 传进来。启动逻辑完全复用
+    `launch_resolved`——两份实现迟早会不一致（一个支持 UWP，另一个忘了）。
+
+    `target` 仍然可以写：那样它就是一条普通的 open_app，留着是为了让用户
+    能把「打开音乐」固定绑到某个程序上。
+    """
+
+    handler_name = "open_target"
+
+    def _resolve(self, ctx: ActionContext | None):  # noqa: ANN202
+        app = (ctx.slots.get("app") if ctx else None)
+        if app is not None:
+            entry = AppEntry(name=app.name, appid=app.appid, system=app.system)
+            r = entry.resolved()
+            if r.ok:
+                return r
+        if self.cfg.target.strip():
+            return resolve_app(self.cfg.target, self.cfg.aliases, self.cfg.describe)
+        return None
+
+    def preflight(self) -> ActionResult:
+        if not self.cfg.target.strip():
+            return ActionResult(True, "运行时才知道要开谁", "目标由应用索引动态解析")
+        r = resolve_app(self.cfg.target, self.cfg.aliases, self.cfg.describe)
+        return ActionResult(r.ok, f"找到 {self.cfg.target}" if r.ok else f"找不到 {self.cfg.target}", r.how)
+
+    def execute(self, ctx: ActionContext) -> ActionResult:
+        if ctx.dry_run:
+            app = ctx.slots.get("app")
+            return ActionResult(True, f"[dry-run] 将启动 {app.name if app else self.cfg.target}")
+        r = self._resolve(ctx)
+        if r is None:
+            return ActionResult(False, "没解析出要打开哪个应用", "意图层没给出目标，target 也没写")
+        if not r.ok:
+            return ActionResult(False, f"找不到应用：{self.cfg.target or '（动态目标）'}", r.how)
+        try:
+            launch_resolved(r, self.cfg.args)
+        except OSError as e:
+            return ActionResult(False, f"启动失败：{e}", r.how)
+        return ActionResult(True, f"已启动 {r.label or r.value}", r.how)
+
+
+def launch_resolved(r, args: list[str] | None = None) -> None:  # noqa: ANN001 - appfind.Resolved
+    """启动一个已解析的应用。失败抛 OSError，调用方负责翻译成 ActionResult。
+
+    从 OpenAppAction 里抽出来，是因为「打开XX」的动态路径（没在配置里写过的应用）
+    也要用同一套启动逻辑——两份实现迟早会不一致。
+    """
+    args = list(args or [])
+    if r.kind == "exe":
+        _popen([r.value, *args])
+    elif r.kind == "shortcut":
+        os.startfile(r.value)  # noqa: S606
+    elif r.kind == "aumid":
+        # UWP / 商店应用没有可直接启动的 exe，必须走 shell:AppsFolder
+        _popen(["explorer.exe", f"shell:AppsFolder\\{r.value}"])
+    else:  # shell
+        _popen(["cmd", "/c", "start", "", r.value, *args])
+
+
 class OpenAppAction(Action):
     handler_name = "open_app"
 
-    def _resolve(self):
-        return resolve_app(self.cfg.target, self.cfg.aliases, self.cfg.describe)
+    RESOLVE_TTL = 600.0
+    """解析结果缓存多久。实测每次重新解析要 ~54ms（对开始菜单里 195 项做 6 个名字的
+    模糊比较），而整条语音链路的其它部分加起来也就 ~200ms。"""
+
+    def __init__(self, cfg) -> None:  # noqa: ANN001
+        super().__init__(cfg)
+        self._cached: tuple[Any, float] | None = None
+
+    def _resolve(self, *, executing: bool = False):  # noqa: ANN202
+        now = time.monotonic()
+        c = self._cached
+        if c is not None and now - c[1] < self.RESOLVE_TTL and self._still_valid(c[0]):
+            return c[0]
+        # 只在真正执行时才允许"没找到就重扫开始菜单"：体检/预检也会找不到
+        # （没装是正常状态），不能每次都为它们起一个 PowerShell
+        r = resolve_app(
+            self.cfg.target, self.cfg.aliases, self.cfg.describe, refresh_on_miss=executing
+        )
+        # 只缓存成功的：没找到时下一次要重新找（用户可能刚装好）
+        self._cached = (r, now) if r.ok else None
+        return r
+
+    @staticmethod
+    def _still_valid(r) -> bool:  # noqa: ANN001
+        """缓存的 exe 被卸载/移走了就作废。aumid/shell 没法便宜地验证，信它。"""
+        if r.kind in ("exe", "shortcut"):
+            try:
+                return Path(r.value).is_file()
+            except OSError:
+                return False
+        return True
 
     def preflight(self) -> ActionResult:
         r = self._resolve()
@@ -112,7 +209,7 @@ class OpenAppAction(Action):
         return ActionResult(False, f"找不到 {what}", r.how)
 
     def execute(self, ctx: ActionContext) -> ActionResult:
-        r = self._resolve()
+        r = self._resolve(executing=not ctx.dry_run)
         if not r.ok:
             return ActionResult(
                 False,
@@ -122,18 +219,10 @@ class OpenAppAction(Action):
         if ctx.dry_run:
             return ActionResult(True, f"[dry-run] 将启动 {r.label or r.value}", r.how)
 
-        args = list(self.cfg.args)
         try:
-            if r.kind == "exe":
-                _popen([r.value, *args])
-            elif r.kind == "shortcut":
-                os.startfile(r.value)  # noqa: S606
-            elif r.kind == "aumid":
-                # UWP / 商店应用没有可直接启动的 exe，必须走 shell:AppsFolder
-                _popen(["explorer.exe", f"shell:AppsFolder\\{r.value}"])
-            else:  # shell
-                _popen(["cmd", "/c", "start", "", r.value, *args])
+            launch_resolved(r, self.cfg.args)
         except OSError as e:
+            self._cached = None  # 启动失败的结果不能留在缓存里
             return ActionResult(False, f"启动失败：{e}", r.how)
         return ActionResult(True, f"已启动 {r.label or r.value}", r.how)
 
@@ -443,17 +532,204 @@ class ShellAction(Action):
 
 
 # --------------------------------------------------------------------------- #
+# handler: close_app
+# --------------------------------------------------------------------------- #
+
+SHELL_EXES = frozenset({"explorer.exe"})
+"""Windows 外壳进程。taskkill 杀掉它会把整个桌面（任务栏、图标）一起带走，
+Windows 通常会自动重开，于是表现为"屏幕闪一下、窗口全没了"。
+它该收到的是**关窗口**的消息，不是终止进程。"""
+
+_GENTLE_HINTS: frozenset[str] = frozenset()
+"""保留位：将来若要给个别应用强制走"温柔关闭"，把 exe 名加到这里。
+现在不用它——判据是**实测那个进程有没有可见窗口**（见 `has_visible_window`），
+比维护一张"哪些程序怕被强杀"的名单可靠得多。"""
+
+
+def close_plan_for(
+    names: list[str],
+    *,
+    has_window: Callable[[str], bool] | None = None,
+    force: bool = False,
+) -> list[tuple[str, str]]:
+    """要关掉这些进程名，各用哪条命令。返回 [(exe 名, 方法)]。
+
+    方法只有三种：
+        taskkill     正常收尾（给它的顶层窗口发关闭消息）
+        taskkill-f   立刻终止
+        explorer     外壳进程专用：只关窗口，不杀进程
+
+    为什么不能一律 /F：/F 是"立刻终止"，Office 这类程序来不及存盘，
+    用户的文档就没了。所以**有窗口**的先走不带 /F 的那条，没有窗口的
+    （后台服务、托盘常驻）不带 /F 会直接失败，只能强制。
+
+    纯函数：窗口有无由调用方注入，测试因此不用真的起进程。
+    """
+    probe = has_window or has_visible_window
+    out: list[tuple[str, str]] = []
+    for raw in names:
+        exe = normalize_exe(raw)
+        if not exe:
+            continue
+        if exe in SHELL_EXES:
+            out.append((exe, "explorer"))
+            continue
+        if force:
+            out.append((exe, "taskkill-f"))
+        elif probe(exe):
+            out.append((exe, "taskkill"))
+        else:
+            out.append((exe, "taskkill-f"))
+    return out
+
+
+def normalize_exe(raw: str) -> str:
+    """统一成 `xxx.exe` 小写形式，顺带挡掉路径和空白。
+
+    只接受**纯文件名**：`taskkill /IM` 要的是进程映像名，不是路径；
+    而带路径的输入一律取文件名，这样 `C:\\...\\Weixin.exe` 也能用。
+    """
+    s = raw.strip().strip('"').replace("/", "\\")
+    if not s:
+        return ""
+    s = s.rsplit("\\", 1)[-1].lower()
+    if not s.endswith(".exe"):
+        s += ".exe"
+    return s
+
+
+def has_visible_window(exe: str) -> bool:
+    """这个进程现在有没有带标题的窗口。
+
+    用 `tasklist /V` 的"窗口标题"列：没有窗口的进程这一列是 `N/A`（实测确认）。
+    多花一次约 100ms 的调用是值得的——它决定了关闭时**会不会丢掉用户没保存的文档**。
+    """
+    try:
+        r = subprocess.run(  # noqa: S603
+            ["tasklist", "/FI", f"IMAGENAME eq {exe}", "/FO", "CSV", "/V", "/NH"],
+            capture_output=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    text = (r.stdout or b"").decode("utf-8", errors="replace")
+    if "N/A" == text.strip():
+        return False
+    for line in text.splitlines():
+        # CSV 的最后一列是窗口标题；按引号切比按逗号切安全（标题里会有逗号）
+        parts = line.rsplit('","', 1)
+        if len(parts) < 2:
+            continue
+        title = parts[-1].rstrip('"').strip()
+        if title and title.upper() != "N/A":
+            return True
+    return False
+
+
+class CloseAppAction(Action):
+    handler_name = "close_app"
+
+    def _names(self) -> list[str]:
+        """要关的进程名：动作自己的 target/exe，或运行时算出来的（见 ctx.extra）。"""
+        return [str(x) for x in (self.cfg.args or [self.cfg.target]) if str(x).strip()]
+
+    def preflight(self) -> ActionResult:
+        names = self._names()
+        if not cmds_available("taskkill"):
+            return ActionResult(False, "系统里没有 taskkill", "正常 Windows 都自带它")
+        if not names:
+            return ActionResult(True, "运行时才知道要关谁", "目标由应用索引动态解析")
+        return ActionResult(True, f"将关闭 {'、'.join(names)}")
+
+    def execute(self, ctx: ActionContext) -> ActionResult:
+        if ctx.dry_run:
+            names = ctx.extra.get("exe_names") or self._names()
+            return ActionResult(True, f"[dry-run] 将关闭 {'、'.join(names) or '(未指定)'}")
+        names = [str(n) for n in (ctx.extra.get("exe_names") or self._names())]
+        force = bool(ctx.extra.get("force"))
+        if not names:
+            return ActionResult(False, "不知道该关哪个进程", "没解析出应用名")
+
+        killed: list[str] = []
+        failed: list[str] = []
+        for exe, method in close_plan_for(names, force=force):
+            if method == "explorer":
+                _close_explorer_windows()
+                killed.append(f"{exe} 的窗口")
+                continue
+            args = ["taskkill", "/IM", exe] + (["/F"] if method == "taskkill-f" else [])
+            if _run(args):
+                killed.append(exe if method == "taskkill" else f"{exe}（强制）")
+            else:
+                failed.append(exe)
+
+        if killed and not failed:
+            return ActionResult(True, f"已关闭 {'、'.join(killed)}")
+        if killed:
+            return ActionResult(True, f"已关闭 {'、'.join(killed)}", f"没找到：{'、'.join(failed)}")
+        return ActionResult(False, f"没找到正在运行的 {'、'.join(failed)}", "它可能本来就没开")
+
+
+def cmds_available(cmd: str) -> bool:
+    """系统里有没有这个命令。preflight 用它给出"这台机器上能不能跑通"。"""
+    from shutil import which
+
+    return which(cmd) is not None
+
+
+def _run(args: list[str]) -> bool:
+    """跑一条系统命令，只看成败。不捕获输出：taskkill 的报错文本对用户没用。"""
+    try:
+        r = subprocess.run(  # noqa: S603
+            args, capture_output=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def _close_explorer_windows() -> None:
+    """壳层的 `关闭所有窗口`：explorer 进程留着，只把窗口收掉。"""
+    try:
+        subprocess.run(  # noqa: S603
+            ["taskkill", "/IM", "explorer.exe"], capture_output=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+# --------------------------------------------------------------------------- #
 # 注册表
 # --------------------------------------------------------------------------- #
 
 HANDLERS: dict[str, type[Action]] = {
     "open_app": OpenAppAction,
+    "open_target": OpenTargetAction,
     "open_path": OpenPathAction,
     "open_url": OpenUrlAction,
     "sysctl": SysctlAction,
     "keys": KeysAction,
     "shell": ShellAction,
+    "close_app": CloseAppAction,
 }
+
+
+def _register_schedule() -> None:
+    """日程 handler 单独注册。
+
+    它住在 `schedule_action.py` 而不是这个文件里：那个模块要 import
+    `..schedule`（存储/提醒），而 `schedule.py` 又要在启动时被 runner 用到。
+    放在一起会变成 `actions → schedule → actions` 的循环导入。运行时再 import
+    一次，代价是一次模块查找，换来依赖图是单向的。
+    """
+    from .schedule_action import ScheduleAction
+
+    HANDLERS["schedule"] = ScheduleAction
+
+
+_register_schedule()
 
 
 class Registry:

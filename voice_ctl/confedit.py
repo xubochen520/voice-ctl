@@ -28,10 +28,13 @@ from .toml_edit import TomlDoc, TomlEditError, format_action_block
 SETTINGS_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("hotkey", ("keys", "min_duration_ms", "max_duration_ms")),
     ("audio", ("samplerate", "channels", "device", "min_peak")),
-    ("model", ("dir", "language", "use_itn", "num_threads", "provider")),
+    ("model", ("dir", "language", "use_itn", "num_threads", "provider", "pad_ms")),
     ("normalize", ("substitutions", "use_pinyin")),
     ("match", ("threshold", "strip_prefixes", "strip_suffixes")),
     ("decision", ("enabled", "model", "min_confidence", "onnx_dir")),
+    ("intent", ("enabled", "confirm_timeout")),
+    ("schedule", ("enabled", "data_file", "remind_before")),
+    ("llm", ("enabled", "endpoint", "model", "timeout", "max_candidates")),
     ("feedback", ("beep", "beep_start_hz", "beep_end_hz", "beep_ms", "print_result")),
 )
 

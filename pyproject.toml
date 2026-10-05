@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voice-ctl"
-version = "0.2.0"
-description = "按住快捷键说话 → 本地离线识别 → 匹配动作 → 执行。纯离线 Windows 语音指令。"
+version = "0.3.0"
+description = "按住快捷键说话 → 本地离线识别 → 理解整句话 → 执行。纯离线 Windows 语音指令。"
 requires-python = ">=3.10"
 dependencies = [
     "sherpa-onnx>=1.13",

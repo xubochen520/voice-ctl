@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import wave
+from datetime import datetime
 from pathlib import Path
 
 from . import __version__
@@ -136,6 +137,36 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         else:
             soft_missing += 1
             print(f"· {a.id:24} {r.message}  ← 没装这个应用，属正常；装了就能用")
+
+    print("\n--- 意图层与日程 ---")
+    from .schedule import ScheduleStore, default_store_path
+
+    if cfg.intent.enabled:
+        from .apps import AppIndex
+
+        idx = AppIndex(use_pinyin=cfg.normalize.use_pinyin)
+        n_apps = len(idx.entries())
+        if n_apps:
+            print(f"✓ 意图层开启：动词/否定/时间识别 + {n_apps} 个已安装应用可动态打开")
+        else:
+            print("· 意图层开启，但读不到开始菜单应用列表（只能开配置里写过的应用）")
+            print("  试：powershell -Command Get-StartApps   （有输出就说明系统能给）")
+    else:
+        print("· 意图层关闭（[intent].enabled = false），只用别名匹配")
+
+    if cfg.schedule.enabled:
+        sp = cfg.schedule_path() or default_store_path()
+        st = ScheduleStore(sp)
+        if st.load_error:
+            print(f"✗ 日程文件有问题：{st.load_error}")
+        else:
+            pend = st.pending()
+            nxt = st.next_due()
+            tail = f"，最近一条 {nxt:%m-%d %H:%M}" if nxt else ""
+            print(f"✓ 日程 {st.path}：待提醒 {len(pend)} 条{tail}")
+        print("  看全部：voice-ctl schedule    导出：voice-ctl schedule --export 日程.ics")
+    else:
+        print("· 日程关闭（[schedule].enabled = false）")
 
     print("\n--- 热键 ---")
     from .hotkey import HotkeyError, parse_hotkey
@@ -292,12 +323,131 @@ def _build_rt_or_die(args: argparse.Namespace, **kw) -> Runtime | None:
     return None
 
 
+def _parse_now(text: str) -> datetime | None:
+    """把 `--now` 的字符串解析成 datetime。接受几种常见写法，不接受模糊猜测。"""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%m-%d %H:%M"):
+        try:
+            dt = datetime.strptime(text.strip(), fmt)
+        except ValueError:
+            continue
+        return dt.replace(year=datetime.now().year) if fmt == "%m-%d %H:%M" else dt
+    return None
+
+
+def cmd_llm(args: argparse.Namespace) -> int:
+    """探测本机大模型服务，并试着让它给几个动作建议。
+
+    这条命令存在的意义是**先量再开**：`[llm]` 是唯一依赖外部服务的功能，
+    开之前用户应该亲眼看到"它连得上、它挑得对"。没有这条命令，用户只能
+    改配置然后对着麦克风猜。
+    """
+    from .llm import DEFAULT_ENDPOINT, SlotExtractor, candidate_actions
+
+    try:
+        cfg = load_config(args.config)
+    except ConfigError as e:
+        print(f"✗ 配置有问题：{e}")
+        return 2
+
+    endpoint = args.endpoint or cfg.llm.endpoint or DEFAULT_ENDPOINT
+    time_s = args.timeout if args.timeout is not None else cfg.llm.timeout
+    ex = SlotExtractor(endpoint, args.model or cfg.llm.model, timeout=time_s)
+
+    print(f"探测 {endpoint} …")
+    if not ex.probe(force=True):
+        print(f"✗ 连不上：{ex.last_error}")
+        print("  LM Studio：打开开发者模式里的本地服务（默认端口 1234）")
+        print("  Ollama   ：ollama serve，endpoint 用 http://127.0.0.1:11434/v1")
+        print("  确认端口后：voice-ctl llm --endpoint http://127.0.0.1:1234/v1")
+        return 1
+    print(f"✓ 服务可用，模型：{ex.model or '(服务没报模型名)'}")
+    if args.probe:
+        return 0
+
+    texts = list(args.text)
+    if not texts:
+        if not sys.stdin.isatty():
+            texts = [ln.strip() for ln in sys.stdin if ln.strip()]
+        if not texts:
+            texts = ["有个文件要改一下", "把声音关小一点", "算个数", "随便说点什么"]
+            print("（没给文本，用内置样例）")
+
+    cands = candidate_actions(cfg.enabled_actions, args.candidates)
+    print(f"候选 {len(cands)} 个（[llm].max_candidates 控制）：{', '.join(c[0] for c in cands)}")
+    rc = 0
+    for t in texts:
+        s = ex.suggest(t, cands)
+        if s is None:
+            print(f"\n「{t}」→ 没拿到结果（{ex.last_error or '输出解析不了'}）")
+            rc = 1
+            continue
+        verdict = s.action_id or "(null：它认为候选里没有合适的)"
+        known = "" if s.action_id is None or s.action_id in {c[0] for c in cands} else "  ← 编的，会被忽略"
+        print(f"\n「{t}」→ {verdict}{known}   {s.ms:.0f}ms")
+        if s.title:
+            print(f"    标题：{s.title}")
+    return rc
+
+
+def cmd_schedule(args: argparse.Namespace) -> int:
+    """看、加、删日程，以及导出 .ics。
+
+    语音是主要入口，但没有这条命令的话有几件事做不了：**导出**（用户想把提醒
+    弄进手机日历）、**离线核对**（为什么不响？）、以及在没有麦克风的机器上
+    先试试日程功能。
+    """
+    from .schedule import ScheduleStore, default_store_path, write_ics
+
+    try:
+        cfg = load_config(args.config)
+        path = cfg.schedule_path()
+    except ConfigError:
+        path = None
+    store = ScheduleStore(path or default_store_path())
+    if store.load_error:
+        print(f"⚠ {store.load_error}")
+
+    if args.export:
+        events = store.all() if args.all else store.pending()
+        out = write_ics(args.export, events)
+        print(f"✓ 已导出 {len(events)} 条到 {out}")
+        print("  导入方式：双击它（Windows 日历/Outlook），或发到手机上点开")
+        return 0
+
+    if args.clear:
+        n = store.clear_finished()
+        print(f"✓ 清掉 {n} 条已提醒/已错过的")
+        return 0
+
+    items = store.all() if args.all else store.pending()
+    if not items:
+        print("（没有日程。说「明天早上八点提醒我开会」就能加一条）")
+        return 0
+    now = datetime.now()
+    print(f"日程文件：{store.path}")
+    for e in items:
+        late = "（已错过）" if e.status == "missed" else ""
+        head = "→" if e.status == "pending" and e.start >= now else " "
+        print(f"{head} [{e.status:8}] {e.start:%Y-%m-%d %H:%M}  {e.title} {late}".rstrip())
+        if e.note:
+            print(f"      原话：{e.note}")
+    return 0
+
+
 def cmd_simulate(args: argparse.Namespace) -> int:
-    """不打字、不说话，直接把文本喂进「归一化→匹配→执行」链路。"""
+    """不打字、不说话，直接把文本喂进「意图 → 匹配 → 执行」链路。"""
     rt = _build_rt_or_die(args, with_asr=False, with_decision=None if not args.no_decision else False)
     if rt is None:
         return 2
     pipe = rt.pipeline()
+    if args.no_intent:
+        pipe.intent_enabled = False
+    if args.now:
+        fixed = _parse_now(args.now)
+        if fixed is None:
+            print(f'✗ --now 看不懂：{args.now!r}；写成 "2026-10-05 10:00"')
+            return 2
+        pipe._clock = lambda: fixed  # noqa: SLF001 - 只给 simulate 用，故意不留公开入口
 
     texts = list(args.text)
     if not texts:
@@ -534,7 +684,27 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("text", nargs="*", help="要模拟的语音文本；留空则从 stdin 读或用内置样例")
     sp.add_argument("--dry-run", action="store_true", help="只显示会做什么，不真的执行")
     sp.add_argument("--no-decision", action="store_true", help="强制关闭语义层，只测别名匹配")
+    sp.add_argument("--no-intent", action="store_true", help="强制关闭意图层，退回纯别名匹配")
+    sp.add_argument(
+        "--now", default=None,
+        help='把"现在"固定成某个时刻（如 "2026-10-05 10:00"），让日程解析可复现',
+    )
     sp.set_defaults(func=cmd_simulate)
+
+    sp = sub.add_parser("schedule", help="查看 / 导出 / 清理日程提醒")
+    sp.add_argument("--all", action="store_true", help="连已提醒、已错过的也列出来")
+    sp.add_argument("--export", default=None, metavar="FILE.ics", help="导出成 .ics 日历文件")
+    sp.add_argument("--clear", action="store_true", help="清掉已提醒/已错过/已取消的")
+    sp.set_defaults(func=cmd_schedule)
+
+    sp = sub.add_parser("llm", help="探测本机大模型服务，并让它试着挑动作（可选功能）")
+    sp.add_argument("text", nargs="*", help="要试的句子；留空则从 stdin 读或用内置样例")
+    sp.add_argument("--endpoint", default=None, help="覆盖 [llm].endpoint")
+    sp.add_argument("--model", default=None, help="覆盖 [llm].model")
+    sp.add_argument("--timeout", type=float, default=None, help="单次请求超时秒数")
+    sp.add_argument("--candidates", type=int, default=12, help="给模型看几个候选动作")
+    sp.add_argument("--probe", action="store_true", help="只探测服务，不试句子")
+    sp.set_defaults(func=cmd_llm)
 
     sp = sub.add_parser("record", help="录一段音频存成 wav")
     sp.add_argument("--seconds", type=float, default=3.0, help="录音秒数（默认 3）")

@@ -17,6 +17,7 @@ from difflib import SequenceMatcher
 from typing import TYPE_CHECKING, Iterable
 
 from .normalize import Normalizer, ascii_slug, canonical, fuzzy_key
+from .timeparse import parse_when
 
 if TYPE_CHECKING:  # pragma: no cover
     from .config import ActionConfig
@@ -25,6 +26,17 @@ if TYPE_CHECKING:  # pragma: no cover
 # canonical() 会把它们一起清掉，于是 sys.show_desktop / sys.showdesktop /
 # 用户说的 showdesktop 三者等价。
 _ID_SEP = re.compile(r"[_.]+")
+
+SWALLOWED_PENALTY = 0.7
+"""别名被句子的时间成分"吞掉"时的打折系数。
+
+实测缺陷：说「设置今天下午三点的日程我要玩游戏」，别名「设置」被命中（0.912），
+于是打开了 Windows 设置。别名确实是句子里的一部分，但它是**动词短语的一部分**，
+宾语是「日程」——用户要的是日程。
+
+判据见 `_alias_swallowed()`。打折而不是一票否决，是为了让 exact（1.00 → 0.70）
+仍然排在最前面：真想说「设置」时它照样能用，只是不再压过别的候选。
+"""
 
 
 def id_segments(action_id: str) -> list[str]:
@@ -51,6 +63,17 @@ class Match:
     normalized_input: str = ""
     """归一化后的用户输入，用于诊断。"""
 
+    raw_input: str = ""
+    """ASR 原文。动作要的往往是它：归一化会改写内容（「一个/那个/一下」被删、
+    同音字被替换、结尾的「吧」被剥掉），日程标题这类自由文本必须用原文。"""
+
+    penalized: bool = False
+    """这条候选被「别名被时间成分吞掉」打了折。
+
+    必须记下来：区分字消歧会把胜者**置为满分**，那一下正好把打折又抹平了
+    （实测「设置今天下午三点的日程…」靠区分字「设」翻盘回到 1.00）。
+    被罚过的候选不该再参与翻盘——它本来就只是"碰巧包含别名"。"""
+
     @property
     def hit(self) -> bool:
         return self.score > 0
@@ -76,6 +99,43 @@ def ratio(a: str, b: str) -> float:
         cover = len(short) / len(long)
         r = max(r, 0.75 + 0.25 * cover)
     return r
+
+
+_GLUE_CHARS = frozenset(" \t的了要个把给在到我你他她它，,。.、一下然后就是")
+
+
+def _alias_swallowed(text: str, alias_key: str, now=None) -> bool:  # noqa: ANN001 - now 仅供测试注入
+    """别名是不是被这句话里的**时间成分**吞掉了（它是参数，不是在指那个东西）。
+
+    两个方向都算吞掉，都是实测遇到的：
+
+        「设置今天下午三点的日程」   别名在前，紧跟一个时间 → 宾语是「日程」
+        「下午三点的日程」           别名在后，紧跟在一个时间后面
+
+    刻意不处理"别名出现在时间**之后**、中间没有连接词"的情况（「三点打开计算器」）：
+    那是正常句子，动词在时间后面本来就很常见。
+    """
+    if not alias_key:
+        return False
+    span = parse_when(text, now)
+    if span is None or not span.spans:
+        return False
+
+    low = text.lower()
+    pos = low.find(alias_key)
+    if pos < 0:
+        return False
+
+    for start, end in span.spans:
+        # 别名在前，紧跟时间（中间只允许连接字）
+        if pos + len(alias_key) <= start and all(
+            ch in _GLUE_CHARS for ch in text[pos + len(alias_key): start]
+        ):
+            return True
+        # 别名在后，紧跟时间（中间只允许连接字，典型是「的」）
+        if end <= pos and all(ch in _GLUE_CHARS for ch in text[end:pos]):
+            return True
+    return False
 
 
 class Matcher:
@@ -180,6 +240,10 @@ class Matcher:
             return top, second
         if top.score - second.score > self.disambiguation_margin:
             return top, second
+        # 被"时间成分吞掉"罚过的候选不参与翻盘：它本来就只是碰巧包含别名，
+        # 给它置满分等于把刚做的打折又抹掉（实测会退回打开 Windows 设置）。
+        if top.penalized or second.penalized:
+            return top, second
 
         top_ck = canonical(_ID_SEP.sub(".", top.alias))
         sec_ck = canonical(_ID_SEP.sub(".", second.alias))
@@ -217,8 +281,9 @@ class Matcher:
         ask_in: str,
         norm_text: str,
     ) -> Match:
-        def mk(score: float, strategy: str) -> Match:
-            return Match(action_id, score, display, strategy, normalized_input=norm_text)
+        def mk(score: float, strategy: str, *, penalized: bool = False) -> Match:
+            return Match(action_id, score, display, strategy,
+                         normalized_input=norm_text, penalized=penalized)
 
         # 1. 规范形式完全相同
         if ck == ck_in:
@@ -227,7 +292,11 @@ class Matcher:
         # 2. 用户话里包含完整别名 —— 最可靠的实用信号
         if ck and ck in ck_in:
             cover = len(ck) / len(ck_in)
-            return mk(0.90 + 0.10 * cover, "alias-hit")
+            score = 0.90 + 0.10 * cover
+            # 别名被句子的时间成分吞掉时打折：见 _alias_swallowed 的实测说明
+            if _alias_swallowed(norm_text, ck):
+                return mk(score * SWALLOWED_PENALTY, "alias-hit", penalized=True)
+            return mk(score, "alias-hit")
 
         # 3. 拼音首字母命中（"威信"→wx，别名"微信"→wx）
         if fk and fk_in and len(fk) >= 2 and fk == fk_in:

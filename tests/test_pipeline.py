@@ -77,7 +77,9 @@ def test_process_text_matches_and_is_dry(cfg):
     p = make_pipeline(cfg)
     out = p.process_text("打开记事本", dry_run=True)
     assert out.action_id == "open.notepad"
-    assert out.via == "matcher"
+    # 0.3.0 起「打开XX」由**意图层**判（动词 + 动态应用词典），所以 via 是 intent；
+    # 意图层关掉时同一句话走别名匹配，via 就该是 matcher。两条路都不许判错动作。
+    assert out.via in ("intent", "matcher"), out.via
     assert out.match is not None and out.match.score >= 0.8
     assert out.result is not None and out.result.ok
     assert "dry-run" in out.result.message

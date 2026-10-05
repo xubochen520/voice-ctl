@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from . import events
+from . import appfind
 from .actions import ActionResult, build_registry
 from .app import Outcome, Pipeline
 from .asr import Asr, AsrError
@@ -67,6 +68,10 @@ class Runtime:
     registry: Any
     asr: Asr
     decider: object | None = None
+    app_index: Any = None
+    """已安装应用索引（意图层用它理解「打开QQ」）。"""
+    llm: Any = None
+    """可选的小模型层（voice_ctl.llm.SlotExtractor）。"""
 
     def pipeline(self) -> Pipeline:
         return Pipeline(
@@ -77,6 +82,10 @@ class Runtime:
             normalizer=self.normalizer,
             decider=self.decider,
             min_confidence=self.cfg.decision.min_confidence,
+            app_index=self.app_index,
+            intent_enabled=self.cfg.intent.enabled,
+            llm=self.llm,
+            llm_candidates=self.cfg.llm.max_candidates,
         )
 
 
@@ -111,7 +120,23 @@ def build_runtime(
         use_itn=cfg.model.use_itn,
         num_threads=cfg.model.num_threads,
         provider=cfg.model.provider,
+        pad_ms=cfg.model.pad_ms,
     )
+
+    # 已安装应用索引：意图层理解「打开QQ」靠它。构建很便宜（几百个名字+拼音），
+    # 但底层的开始菜单扫描要起一次 PowerShell（冷启动实测约 0.8s）。
+    # `warm_start_apps()` 在后台线程里把那份列表扫好，等用户第一次说话时
+    # 索引已经是热的——冷的那 0.8 秒会正好落在"用户松开热键等结果"的那一刻。
+    app_index = None
+    if cfg.intent.enabled:
+        from .apps import AppIndex
+
+        appfind.warm_start_apps()
+        app_index = AppIndex(use_pinyin=cfg.normalize.use_pinyin)
+        # 当场把条目建出来。AppIndex 自己也是懒构建的，但那会在**用户说完第一句
+        # 话**时触发——如果后台预热线程还没扫完，索引里就是空的，于是"打开QQ"
+        # 报找不到。这里先把（可能是空的）快照定下来，预热完成后重建一次即可。
+        app_index.entries()
 
     decider = None
     want = cfg.decision.enabled if with_decision is None else with_decision
@@ -127,7 +152,23 @@ def build_runtime(
             )
             decider = None
 
-    return Runtime(cfg, norm, matcher, registry, asr, decider)
+    # 小模型层（可选）。探测失败只记一条日志——没装 LM Studio/Ollama 是常态，
+    # 不该在界面上刷一堆警告。
+    llm = None
+    if cfg.llm.enabled:
+        from .llm import SlotExtractor
+
+        llm = SlotExtractor(
+            cfg.llm.endpoint, cfg.llm.model, timeout=cfg.llm.timeout,
+        )
+        if not llm.probe():
+            (bus or events.get_bus()).emit(
+                "warn", f"小模型层开启但服务连不上，本句起回落到前几层：{llm.last_error}",
+                kind="llm",
+            )
+            llm = None
+
+    return Runtime(cfg, norm, matcher, registry, asr, decider, app_index, llm)
 
 
 class _Emitter:
@@ -296,6 +337,9 @@ class Engine:
             self._rt = rt
             self._pipe = rt.pipeline()
         self._start_worker()
+        # 提醒线程跟着运行时一起起来：它和监听热键无关（电脑开着就该提醒，
+        # 哪怕热键没启动），所以放在 prepare 而不是 start 里。
+        self._start_reminders()
         self._set_state(IDLE)
         self.ev.ok(
             f"就绪：{len(rt.registry)} 个动作，热键 {self.hotkey_spec}"
@@ -309,6 +353,19 @@ class Engine:
         self._set_state(ERROR, error=message)
         self.stats.errors += 1
         self.ev.error(message, kind="engine")
+
+    def _start_reminders(self) -> None:
+        """把到点提醒接上。日程关掉时什么都不做。"""
+        if not self.cfg.schedule.enabled:
+            return
+        from . import reminder
+
+        try:
+            reminder.start(path=self.cfg.schedule_path())
+        except Exception as e:  # noqa: BLE001 - 提醒起不来不该让整个程序不可用
+            self.ev.warn(f"提醒服务启动失败（日程仍可创建）：{type(e).__name__}: {e}", kind="schedule")
+            return
+        self.ev.info(reminder.status(), kind="schedule")
 
     # -- 加载模型（慢） --------------------------------------------------- #
 
@@ -536,6 +593,10 @@ class Engine:
             w.join(timeout=1.0)
         with self._lock:
             self._worker = None
+        if self.cfg.schedule.enabled:
+            from . import reminder
+
+            reminder.stop()
 
     # -- 热键 ------------------------------------------------------------- #
 

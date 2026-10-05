@@ -223,6 +223,12 @@ class FakeDecider:
 
 
 def make_pipe(cfg: AppConfig, decider):  # noqa: ANN001, ANN201
+    """语义层的集成测试，**刻意关掉意图层**。
+
+    这些用例要验的是"别名匹配和语义层谁先谁后"，而意图层是排在两者之前的
+    第三层。开着它的话，「打开计算器」会被意图层直接判掉，语义层根本没机会
+    被调用——测出来的就不是这三个的优先级了。
+    """
     from voice_ctl.actions import build_registry
     from voice_ctl.app import Pipeline
     from voice_ctl.matcher import Matcher
@@ -237,6 +243,7 @@ def make_pipe(cfg: AppConfig, decider):  # noqa: ANN001, ANN201
         normalizer=n,
         decider=decider,
         min_confidence=0.6,
+        intent_enabled=False,
     )
 
 

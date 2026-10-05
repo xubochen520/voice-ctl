@@ -88,7 +88,15 @@ def exe_dir() -> Path:
 
 
 def data_dir() -> Path:
-    """可写数据目录。优先 exe 同级；那里不可写（比如装在 Program Files）时退回用户目录。"""
+    """可写数据目录。优先 exe 同级；那里不可写（比如装在 Program Files）时退回用户目录。
+
+    环境变量 `VOICE_CTL_DATA` 可以整个改掉位置（便携使用、多份配置并存、测试隔离）。
+    """
+    override = os.environ.get("VOICE_CTL_DATA", "").strip()
+    if override:
+        p = Path(override).expanduser()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
     base = exe_dir()
     try:
         probe = base / ".voice-ctl-write-test"

@@ -197,7 +197,9 @@ def test_outcome_event_carries_structured_fields(engine: Engine, bus: events.Eve
     ev = [e for e in bus.snapshot() if e.kind == "outcome"][-1]
     assert ev.data["action"] == "open.calc"
     assert ev.data["ok"] is True
-    assert ev.data["via"] == "matcher"
+    # via 说明这句话是哪一层判的：0.3.0 起「打开XX」由意图层判（intent），
+    # 意图层关掉时是 matcher，语义层兜住的是 decision
+    assert ev.data["via"] in ("intent", "matcher"), ev.data["via"]
     assert isinstance(ev.data["ms"], float)
 
 

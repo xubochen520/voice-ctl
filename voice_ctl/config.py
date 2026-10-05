@@ -11,7 +11,28 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Union
 
-VALID_HANDLERS = {"open_app", "open_path", "open_url", "sysctl", "keys", "shell"}
+_FALLBACK_HANDLERS = frozenset({
+    "open_app", "open_target", "open_path", "open_url", "sysctl", "keys", "shell", "close_app", "schedule",
+})
+"""handler 名单的兜底。
+
+正常情况下从 `actions.HANDLERS` 现取——**名单只该有一份**。以前这里写死了一份
+副本，结果新加的 handler（open_target / close_app / schedule）在 `build_registry`
+里认得、在配置校验里却不认得，报错说"不认识"，而它明明就在注册表里躺着。
+兜底只在 import 失败时用得上（比如只读环境里跑配置校验）。"""
+
+
+def valid_handlers() -> frozenset[str]:
+    try:
+        from .actions import HANDLERS
+
+        return frozenset(HANDLERS)
+    except Exception:  # noqa: BLE001 - 拿不到就用兜底，不要因为校验名单让配置读不了
+        return _FALLBACK_HANDLERS
+
+
+VALID_HANDLERS = _FALLBACK_HANDLERS
+"""历史名字，保持向后兼容。新代码请用 `valid_handlers()`。"""
 
 
 class ConfigError(Exception):
@@ -83,7 +104,15 @@ class ModelConfig:
     num_threads: int = 2
     provider: str = "cpu"
 
+    pad_ms: int = 300
+    """识别前在波形头尾各补多少毫秒静音（0 = 不补）。
+
+    实测不补时首字会随机丢失（「明天」→「天」），补 200ms 以上就稳了。
+    见 asr.DEFAULT_PAD_MS 的说明。"""
+
     def validate(self) -> None:
+        if not 0 <= self.pad_ms <= 2000:
+            raise ConfigError(f"[model].pad_ms 必须在 0-2000，实际 {self.pad_ms}")
         if self.language not in ("auto", "zh", "en", "ja", "ko", "yue"):
             raise ConfigError(
                 f"[model].language 只能是 auto/zh/en/ja/ko/yue 之一，实际 {self.language!r}"
@@ -165,6 +194,78 @@ class NormalizeCfg:
 
 
 @dataclass
+class IntentConfig:
+    """意图层：动词/否定/时间/动态应用词典（见 voice_ctl/intent.py）。
+
+    它修的是别名匹配的三个实测缺陷：「设置今天下午三点的日程」被当成打开设置、
+    「关闭微信」反而打开微信、「打开QQ」因为没有对应 [[action]] 而什么都匹配不上。
+
+    默认开着——这三个缺陷都比意图层本身的风险更常见。真觉得它误判了，
+    把它关掉就退回纯别名匹配，行为和 0.2.0 完全一致。
+    """
+
+    enabled: bool = True
+
+    confirm_timeout: float = 12.0
+    """确认卡等多久。超时按"放弃"处理——总比无限期占着工作线程好。"""
+
+    def validate(self) -> None:
+        if self.confirm_timeout <= 0:
+            raise ConfigError("intent.confirm_timeout 必须大于 0")
+
+
+@dataclass
+class ScheduleConfig:
+    """日程 / 提醒（见 voice_ctl/schedule.py）。
+
+    默认落地在可写数据目录的 schedule.json，不依赖任何账号或云端日历。
+    """
+
+    enabled: bool = True
+
+    data_file: str = ""
+    """日程文件位置。留空 = 可写数据目录下的 schedule.json。相对路径按配置文件所在目录解析。"""
+
+    remind_before: int = 0
+    """默认提前几分钟提醒。"""
+
+    def validate(self) -> None:
+        if self.remind_before < 0:
+            raise ConfigError("schedule.remind_before 不能是负数")
+
+
+@dataclass
+class LLMConfig:
+    """可选的小模型层：用本机跑着的大模型服务兜住前几层的长尾（见 voice_ctl/llm.py）。
+
+    默认**关闭**，因为它依赖外部服务。开之前先确认服务在跑：
+        LM Studio：打开开发者模式里的本地服务（默认 127.0.0.1:1234）
+        Ollama  ：ollama serve，然后把 endpoint 改成 http://127.0.0.1:11434/v1
+
+    开之前建议先量一下它到底值不值：
+        voice-ctl llm --probe      （探测服务 + 报模型名）
+        voice-ctl llm "有个文件要改一下"   （看它建议哪个动作）
+    """
+
+    enabled: bool = False
+    endpoint: str = "http://127.0.0.1:1234/v1"
+    model: str = ""
+    """留空 = 用服务上加载的第一个模型。"""
+    timeout: float = 4.0
+    """单次推理超时（秒）。本机小模型通常 0.3-2 秒；超过 4 秒说明它在算别的。"""
+    max_candidates: int = 12
+    """给模型看几个候选。它越多越容易乱挑（官方 20 选项任务只有 0.451）。"""
+
+    def validate(self) -> None:
+        if self.timeout <= 0:
+            raise ConfigError("llm.timeout 必须大于 0")
+        if self.max_candidates < 1:
+            raise ConfigError("llm.max_candidates 至少是 1")
+        if self.enabled and not self.endpoint.strip():
+            raise ConfigError("llm.enabled = true 时必须给出 endpoint")
+
+
+@dataclass
 class FeedbackConfig:
     beep: bool = True
     """开始/结束录音的提示音。"""
@@ -202,10 +303,10 @@ class ActionConfig:
     def validate(self) -> None:
         if not self.id.strip():
             raise ConfigError("[[action]] 缺少 id")
-        if self.handler not in VALID_HANDLERS:
+        if self.handler not in valid_handlers():
             raise ConfigError(
                 f"动作 {self.id!r} 的 handler={self.handler!r} 不认识；"
-                f"支持：{', '.join(sorted(VALID_HANDLERS))}"
+                f"支持：{', '.join(sorted(valid_handlers()))}"
             )
         if not self.aliases and not self.describe and not self.target:
             raise ConfigError(f"动作 {self.id!r} 既没有 aliases 也没有 target，无法匹配")
@@ -226,6 +327,9 @@ class AppConfig:
     normalize: NormalizeCfg = field(default_factory=NormalizeCfg)
     match: MatchConfig = field(default_factory=MatchConfig)
     decision: DecisionConfig = field(default_factory=DecisionConfig)
+    intent: IntentConfig = field(default_factory=IntentConfig)
+    schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
     feedback: FeedbackConfig = field(default_factory=FeedbackConfig)
     actions: list[ActionConfig] = field(default_factory=list)
 
@@ -238,6 +342,9 @@ class AppConfig:
         self.model.validate()
         self.match.validate()
         self.decision.validate()
+        self.intent.validate()
+        self.schedule.validate()
+        self.llm.validate()
 
         if not self.actions:
             raise ConfigError("配置里没有任何 [[action]]，程序无可执行的动作")
@@ -269,6 +376,17 @@ class AppConfig:
             p = self.source.parent / p
         return p.resolve()
 
+    def schedule_path(self) -> Path | None:
+        """日程文件位置。留空返回 None，由 schedule.default_store_path() 决定
+        （它会去看 VOICE_CTL_SCHEDULE_FILE 环境变量和可写数据目录）。"""
+        raw = (self.schedule.data_file or "").strip()
+        if not raw:
+            return None
+        p = Path(raw).expanduser()
+        if not p.is_absolute() and self.source is not None:
+            p = self.source.parent / p
+        return p.resolve()
+
     def describe(self) -> str:
         lines = [
             f"配置文件   : {self.source}",
@@ -278,6 +396,11 @@ class AppConfig:
             f"threads={self.model.num_threads} provider={self.model.provider}",
             f"匹配阈值   : {self.match.threshold}",
             f"语义决策   : {'开启' if self.decision.enabled else '关闭'}",
+            f"意图层     : {'开启' if self.intent.enabled else '关闭'}"
+            + ("（动词/否定/动态应用/日程）" if self.intent.enabled else "（只用别名匹配）"),
+            f"日程提醒   : {'开启' if self.schedule.enabled else '关闭'}"
+            + (f"  {self.schedule_path() or '（默认数据目录）'}" if self.schedule.enabled else ""),
+            f"小模型层   : {'开启 ' + self.llm.endpoint if self.llm.enabled else '关闭'}",
             f"动作数     : {len(self.enabled_actions)} / {len(self.actions)} 启用",
         ]
         for a in self.enabled_actions:
@@ -444,12 +567,14 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             raise ConfigError(f"TOML 语法错误（{p}）：{e}") from e
 
     unknown_top = set(raw) - {
-        "hotkey", "audio", "model", "normalize", "match", "decision", "feedback", "action"
+        "hotkey", "audio", "model", "normalize", "match", "decision", "intent", "schedule",
+        "llm", "feedback", "action"
     }
     if unknown_top:
         raise ConfigError(
             f"顶层有无法识别的段：{', '.join(sorted(unknown_top))}；"
-            "可用：hotkey / audio / model / normalize / match / decision / feedback / action"
+            "可用：hotkey / audio / model / normalize / match / decision / intent / "
+            "schedule / llm / feedback / action"
         )
 
     raw_actions = raw.get("action", [])
@@ -463,6 +588,9 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         normalize=_build(NormalizeCfg, _section(raw, "normalize"), "normalize"),
         match=_build(MatchConfig, _section(raw, "match"), "match"),
         decision=_build(DecisionConfig, _section(raw, "decision"), "decision"),
+        intent=_build(IntentConfig, _section(raw, "intent"), "intent"),
+        schedule=_build(ScheduleConfig, _section(raw, "schedule"), "schedule"),
+        llm=_build(LLMConfig, _section(raw, "llm"), "llm"),
         feedback=_build(FeedbackConfig, _section(raw, "feedback"), "feedback"),
         actions=[
             _build(ActionConfig, a, f"action[{i}]")
