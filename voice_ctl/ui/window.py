@@ -314,6 +314,10 @@ class App:
             events.debug(f"写入 {line}", kind="config")
         events.ok(f"{note}（共 {len(ed.changes)} 处改动，注释已保留）", kind="config")
         self.reload_config(quiet=quiet)
+        # 模型目录可能被改过，运行页缓存的存在性判断要作废
+        tab = self.tabs.get("run")
+        if tab is not None:
+            tab._model_present = None  # noqa: SLF001
 
     def save_settings(self, changes: dict[tuple[str, str], Any], *, note: str = "已保存") -> bool:
         try:

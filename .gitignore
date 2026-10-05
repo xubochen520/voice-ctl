@@ -10,6 +10,7 @@ models/
 
 # 打包产物（构建脚本重新生成，不进版本库）
 build/
+build-full/
 dist/
 dist-full/
 *.pdb

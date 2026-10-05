@@ -74,8 +74,8 @@
 
 | 变体 | 体积 | 首次使用 | 启动 |
 |---|---|---|---|
-| **lite** | 54.9 MB | 需跑一次 `download` | **1.6s** |
-| full | 206.9 MB | 开箱即用 | 3.0s（每次解包模型） |
+| **lite** | 58.1 MB | 界面里点一次下载 | **1.7s** |
+| full | 210.0 MB | 开箱即用 | 3.1s（每次解包模型） |
 
 **推荐 lite**——多下一次模型，但每次启动快一倍。
 打包细节见 [docs/BUILDING-EXE.md](docs/BUILDING-EXE.md)。
@@ -407,7 +407,7 @@ voice-ctl simulate "你说的话" --dry-run
 
 ```powershell
 .venv\Scripts\pip install -e ".[dev]"
-.venv\Scripts\python -m pytest                      # 412 个单测，约 30 秒（含真实建窗的界面冒烟测试）
+.venv\Scripts\python -m pytest                      # 413 个单测，约 30 秒（含真实建窗的界面冒烟测试）
 .venv\Scripts\python scripts\bench_e2e.py           # 端到端基准（需先 make_tts_samples.py）
 .venv\Scripts\python scripts\probe_decision.py      # 语义层实测（需先 fetch-decision）
 .venv\Scripts\python scripts\diag_appfind.py        # 应用定位排障：逐级打印找没找到

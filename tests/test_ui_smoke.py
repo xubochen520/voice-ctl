@@ -182,6 +182,31 @@ def test_run_tab_dry_run_toggle(app):  # noqa: ANN001
     assert app.engine.dry_run is False
 
 
+def test_model_pill_distinguishes_missing_from_not_loaded(app, cfg_path: Path):  # noqa: ANN001
+    """「没加载」和「没有」必须分得清。
+
+    完整版内置了模型，只是懒加载；这里如果一律显示"未加载"，用户会以为
+    缺模型，白白去下 226MB。
+    """
+    app.show_tab("run")
+    run = app.tabs["run"]
+    # 这个 fixture 的模型目录是空的
+    run._model_present = None
+    run.on_tick()
+    missing = run._model_pill._text.cget("text")
+    assert "缺少" in missing
+
+    md = cfg_path.parent / "models" / "sense-voice-int8"
+    md.mkdir(parents=True)
+    (md / "model.int8.onnx").write_bytes(b"x" * 1024)
+    (md / "tokens.txt").write_text("a", encoding="utf-8")
+    run._model_present = None
+    run.on_tick()
+    present = run._model_pill._text.cget("text")
+    assert "待加载" in present
+    assert present != missing
+
+
 # --------------------------------------------------------------------------- #
 # 日志页
 # --------------------------------------------------------------------------- #

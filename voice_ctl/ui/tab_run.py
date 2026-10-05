@@ -20,6 +20,7 @@ class RunTab(tk.Frame):
         self._state_pill: W.StatusPill
         self._action_pill: W.StatusPill
         self._report: tk.Text
+        self._model_present: bool | None = None
         self._build()
 
     # -- 构建 ------------------------------------------------------------- #
@@ -138,6 +139,16 @@ class RunTab(tk.Frame):
             w.destroy()
         W.key_pills(self._hot_box, self.app.engine.hotkey_spec, bg=P["surface"]).pack()
 
+    def _model_files_present(self) -> bool:
+        """模型文件在不在。每 120ms 轮询一次，所以结果缓存住。"""
+        if self._model_present is None:
+            try:
+                md = self.app.model_dir()
+                self._model_present = (md / "model.int8.onnx").is_file() and (md / "tokens.txt").is_file()
+            except Exception:  # noqa: BLE001
+                self._model_present = False
+        return self._model_present
+
     def _refresh(self, *, force: bool = False) -> None:
         eng = self.app.engine
         label = eng.state_label
@@ -160,8 +171,13 @@ class RunTab(tk.Frame):
             self._model_pill.set(f"识别模型已加载 {eng.stats.model_load_ms:.0f}ms", P["ok"])
             self._load_btn.state(["disabled"])
         else:
-            self._model_pill.set("识别模型未加载", P["warn"])
+            # 「没加载」和「没有」要分清楚。完整版内置了模型，只是懒加载——
+            # 这里如果一律显示橙色的"未加载"，用户会以为缺模型，白白去下 226MB。
             self._load_btn.state(["!disabled"])
+            if self._model_files_present():
+                self._model_pill.set("识别模型待加载（点启动时会载入）", P["muted"])
+            else:
+                self._model_pill.set("缺少识别模型，去「设置」页下载", P["warn"])
 
         out = eng.last_outcome
         if out is not None or force:
