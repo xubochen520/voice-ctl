@@ -6,7 +6,7 @@
 说「设置今天下午三点的日程我要玩游戏」就真的多一条下午三点的提醒。全程不联网、零调用成本。
 
 - **纯离线**：识别模型跑在本地，音频不出机器
-- **低开销**：无 GPU、不需要 torch，模型常驻约 350MB，识别 RTF≈0.04
+- **低开销**：无 GPU；默认路径不需要 torch，模型常驻约 350MB，识别 RTF≈0.04
 - **有界面**：双击就有窗口——实时日志、录热键、改动作、调参数，不用碰配置文件
 - **听得懂整句话**：「关闭微信」不会打开微信，「设置…日程」不会被当成打开设置
 - **说得出名字的网站就能开**：「打开百度」「打开B站」→ 对应网站；本机装了同名程序时以程序为先
@@ -20,14 +20,16 @@
 
 ## 下载
 
-最新版 **[v0.3.3](https://github.com/xubochen520/voice-ctl/releases/latest)**：
+最新版 **[v0.3.4](https://github.com/xubochen520/voice-ctl/releases/latest)**：
 
 | 产物 | 体积 | 说明 |
 |---|---|---|
-| [voice-ctl-0.3.3-win64-lite.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.3/voice-ctl-0.3.3-win64-lite.exe) | 84MB | **推荐**。首次用要跑一次 `voice-ctl download` 拉识别模型（226MB），之后每次启动都快一倍 |
-| [voice-ctl-0.3.3-win64-full.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.3/voice-ctl-0.3.3-win64-full.exe) | 236MB | 开箱即用，识别模型内嵌。代价是每次启动都要把 226MB 解包到临时目录 |
+| [voice-ctl-0.3.4-win64-lite.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.4/voice-ctl-0.3.4-win64-lite.exe) | 84MB | **推荐**。首次用要跑一次 `voice-ctl download` 拉识别模型（226MB），之后每次启动都快一倍 |
+| [voice-ctl-0.3.4-win64-full.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.4/voice-ctl-0.3.4-win64-full.exe) | 236MB | 开箱即用，识别模型内嵌。代价是每次启动都要把 226MB 解包到临时目录 |
+| `voice-ctl-0.3.4-win64-semantic.zip` | 约 1.8GB | **完全离线**：连语义层和 906MB 权重都内置，什么都不用下。目录版（解压即用） |
 
-两个都是单文件 exe，双击就出界面（命令行也一样用）。功能完全相同，只差识别模型是否内嵌。
+前两个都是单文件 exe，双击就出界面（命令行也一样用）。功能完全相同，只差识别模型是否内嵌。
+语义版是目录版，因为 1.8GB 每次启动都解包到临时目录不可接受。
 
 从源码跑：
 
@@ -35,6 +37,49 @@
 pip install -e .
 voice-ctl ui
 ```
+
+---
+
+## 0.3.4：语义模型内置（但默认不开）
+
+这一版把语义层的 **906MB 权重内置**进包，加了一个 `semantic` 变体：解压即用，
+**一个字节都不用下载**，也不依赖 github.com 或 huggingface.co 可达。体积 1.8GB。
+
+真正要紧的不是那个开关，而是它暴露出的一个缺口：ASR 模型一直有
+`resolve_model_dir()` 兜底（配置路径不存在就去 `_MEIPASS` 里找），
+**语义层没有**。只加打包开关的话，程序照样报「缺少 *.onnx」——
+873MB 打进去了却完全没效果，而且报错不指向真因。现在补上了
+`resolve_decision_dir()`，四处调用点全部改用它。
+
+顺带修掉一个不该发生的重复下载：`voice-ctl fetch-decision` 以前**无条件**下 906MB
+——内置了也照下。现在已就绪就短路，并把落盘位置从"当前工作目录"改成可写数据目录
+（以前从 `C:\Windows\System32` 里跑这个命令，906MB 就下到那儿去了）。
+
+### ⚠ 语义层**没有**默认打开，这是量过之后的决定
+
+本来打算"既然权重都内置了，就顺手自动打开"。写完测完撤销了：
+在 21 个候选动作的真实配置下，**它的置信度和正确性不相关**。
+
+| 该不该命中 | 说法 | 置信度 | 选了什么 |
+|---|---|---|---|
+| 该 | 帮我截个图 | 0.933 | sys.screenshot ✓ |
+| 该 | 我想聊个天 | **0.153** | open.wechat ✓ |
+| **不该** | 这个多少钱 | **1.000** | **web.bilibili** ✗（真的开 B 站） |
+| **不该** | 今天天气怎么样 | 0.921 | schedule ✗ |
+
+正确判断低到 0.153，错误判断高到 1.000——**任何阈值都拦不住后者**。
+`min_confidence = 0.6` 是在 5 候选下定的，换成 21 个候选后正确判断被摊薄
+（「我想聊个天」0.933 → 0.153）。所以默认打开等于默认乱执行。
+
+**权重的内嵌解决的是"装完不用下载"，不是"默认该开"。** 这两件事被分开了：
+解压即用、一个字节不下载 ✓，但要开语义层仍得把 `[decision].enabled` 改成 `true`。
+开之前建议先 `voice-ctl simulate "你的说法"` 试几条，`config.toml` 里那段注释
+也换成了上面这张实测表。
+
+（好消息：句首否定是安全的——「不要打开计算器」「别关微信」在意图层就被拦下了，
+走不到语义层。）
+
+详见 [0.3.4 版本说明](docs/RELEASE-NOTES-0.3.4.md)。
 
 ---
 

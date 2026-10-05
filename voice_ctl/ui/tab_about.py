@@ -109,13 +109,18 @@ class AboutTab(tk.Frame):
 
     def _refresh_paths(self) -> None:
         cfg = self.app.cfg
+        from ..runner import decision_dir_for
+
+        # 内嵌权重时把解包目录标出来，否则用户会照着配置里的路径去找、然后找不到
+        ddir = decision_dir_for(cfg)
+        bundled = "（打包内嵌）" if ddir != cfg.decision_path() else ""
         lines = [
             f"运行方式    {'打包 exe' if bootstrap.is_frozen() else '源码 / venv'}",
             f"可执行文件  {bootstrap.exe_dir()}",
             f"可写数据    {bootstrap.data_dir()}",
             f"配置文件    {self.app.config_path or '（没有，保存设置时会自动生成）'}",
             f"模型目录    {self.app.model_dir()}",
-            f"语义层权重  {cfg.decision_path()}",
+            f"语义层权重  {ddir}{bundled}",
             f"运行日志    {bootstrap.log_path()}",
         ]
         self._paths.configure(state="normal")

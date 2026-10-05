@@ -359,8 +359,11 @@ class SettingsTab(tk.Frame):
 
     def _check_decision(self) -> None:
         from ..decision import available
+        from ..runner import decision_dir_for
 
-        root = self.app.cfg.decision_path()
+        # 用 decision_dir_for 而不是 cfg.decision_path()：后者不知道权重可能
+        # 被内嵌在 _MEIPASS 里，会报"缺少权重"而实际是好的。
+        root = decision_dir_for(self.app.cfg)
         ok, reason = available(root)
         color = P["ok"] if ok else P["muted"]
         extra = ""

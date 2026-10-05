@@ -156,6 +156,54 @@ def resolve_model_dir(configured: Path) -> Path:
     return configured
 
 
+def bundled_decision_dir() -> Path | None:
+    """打包内嵌的语义层权重目录，没有就返回 None。
+
+    单独抽出来是因为有两处要用，而且**必须用同一套路径**：
+      1. `resolve_decision_dir()` —— 运行时找权重
+      2. `ensure_user_config()`  —— 判断要不要自动开语义层
+    两处路径不一致的表现是"权重要么找不到、要么明明在却不自动开"。
+    """
+    bundle = _bundle_dir()
+    if bundle is None:
+        return None
+    for sub in ("models/laya-onnx/multilingual", "laya-onnx/multilingual"):
+        cand = bundle / sub
+        if cand.is_dir():
+            return cand
+    return None
+
+
+def resolve_decision_dir(configured: Path) -> Path:
+    """把配置里的语义层权重目录解析成实际可用的位置。
+
+    和 `resolve_model_dir` 同样是**必须**的兜底，理由一模一样：配置里的
+    `onnx_dir` 是相对路径，按配置文件所在目录解析，而打包后那份 config.toml
+    在 exe 同级——那里没有权重，权重在 `_MEIPASS` 里。没有这个兜底，
+    把 873MB 权重打进 exe 会毫无效果：程序照样说"缺少 *.onnx"。
+
+    三种情况：
+      1. 配置指向的目录真的存在 → 用它（源码运行、或用户自己下了权重）
+      2. 打包内嵌了权重 → 用解包目录里的那份
+      3. 都没有 → 原样返回，让调用方报"缺少权重"并给出下载指引
+
+    另外兜一个 _MEIPASS 之外的常见布局：权重直接放在 exe 同级（用户手动
+    下到那里、或想换一份权重而不重新打包）。这条排在配置之后、内嵌之前，
+    因为它更贴近用户的显式意图——用户放进来的文件应当赢过打包内那份。
+    """
+    if configured.is_dir():
+        return configured
+
+    next_to_exe = exe_dir() / "models" / "laya-onnx" / "multilingual"
+    if next_to_exe.is_dir():
+        return next_to_exe
+
+    bundled = bundled_decision_dir()
+    if bundled is not None:
+        return bundled
+    return configured
+
+
 def bundled_config() -> Path | None:
     """打包内自带的 config.toml（只读模板）。"""
     bundle = _bundle_dir()
@@ -165,13 +213,53 @@ def bundled_config() -> Path | None:
     return p if p.is_file() else None
 
 
+def enable_decision_in_template(text: str) -> str:
+    """把 [decision] 段里的 enabled 改成 true，其余一字不动。
+
+    **不自动调用**，只给用户显式要求时用（界面勾选、或命令行开关）。
+    当初写它是想在内嵌权重的包里自动开语义层，量过之后撤销了这个想法——
+    理由见下，值得记着免得再犯：
+
+    在 21 个候选动作的真实配置下实测 11 条口语 + 14 条非命令：
+      真该命中的置信度     0.15 ~ 0.93（"我想聊个天" 只有 0.153）
+      不该命中的置信度     0.20 ~ 1.00（"这个多少钱" → web.bilibili **1.000**）
+    置信度和正确性**不相关**，所以任何阈值都拦不住后者。默认打开等于默认
+    乱执行——那是比"少一个功能"严重得多的缺陷。权重的内嵌解决的是
+    "装完不用下载"，不是"默认该开"。
+
+    用 TomlDoc 而不是字符串替换，是为了**保住那一段上面二十多行的注释**：
+    那里写着这一层的实测精度，是用户判断要不要开它的唯一依据。
+    正则只匹配 `enabled` 这个键名、且只在 [decision] 段内替换，避免碰到
+    [model] / [web] / [intent] 各自的 enabled。
+
+    模板结构变了也不会静默出错：TomlDoc 找不到那个键时原样返回。
+    """
+    from .toml_edit import TomlDoc, TomlEditError
+
+    try:
+        doc = TomlDoc(text)
+        if not doc.has_section("decision"):
+            return text
+        if doc.value("decision", "enabled", default=False) is True:
+            return text
+        if not doc.set("decision", "enabled", True):
+            return text
+        return doc.text()
+    except TomlEditError:
+        # 模板坏到解析不了时不改它——宁可让用户手动开，也不要写出一份半坏的配置
+        return text
+
+
 def ensure_user_config() -> Path | None:
     """保证 exe 旁边有一份**可编辑**的 config.toml。
 
     打包后内置配置在只读的临时解包目录里，用户改不了也留不住。所以首次运行
     复制一份到可写数据目录；之后用户改的就是这一份，升级 exe 不会覆盖它。
 
-    返回用户配置的路径；没有内置模板时返回 None（调用方回落到 dataclass 默认值）。
+    注意这里**刻意不自动打开 [decision]**，即使这个包把 906MB 权重都内嵌了。
+    理由见 `enable_decision_in_template()` 的注释：语义层在候选集之外的输入上
+    会给出高置信度的错误答案，默认打开等于默认乱执行。权重内嵌解决的是
+    "装完不用下载"，不是"默认该开"。
     """
     target = data_dir() / "config.toml"
     if target.is_file():

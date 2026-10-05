@@ -56,17 +56,33 @@ strip_suffixes = ["谢谢", "吧", "啊", "呀", "呢", "一下", "好么", "好
 #   3. 把下面的 enabled 改成 true
 #   4. voice-ctl doctor 确认语义层显示 ✓
 #
-# 实测：6 选项零样本下判「有个文件要改一下」「把声音关小」这类口语全对，
-# 单次推理 42-58ms，加载 10.4s（只加载一次）。但它只该兜住第 0 层漏掉的输入，
-# 不该当主判据——官方 benchmark 里 20 选项意图任务是 0.451。
+# 实测（5 候选：记事本/计算器/微信/截图/锁屏，零样本）：
+#   有个文件要改一下 → notepad 0.999      算个数 → calc 0.786
+#   我想聊个天     → wechat  0.933      帮我截个图 → screenshot 0.999
+#   屏幕别让人看了  → lock    0.829
+# 单次推理 42-58ms，加载 10.4s（只加载一次）。
+#
+# ⚠ 但在**本文件这套 21 个动作**下，它的置信度和正确性不相关（0.3.4 实测
+#   11 条口语 + 14 条非命令）：
+#     真该命中：「我想聊个天」只有 0.153、「屏幕别让人看了」0.290
+#     不该命中：「这个多少钱」→ web.bilibili **1.000**（真的会开 B 站）
+#              「今天天气怎么样」→ schedule 0.921
+#   阈值拦不住后面这类，因为它比正确判断还高。所以 min_confidence **在这套
+#   动作下基本不起筛选作用**；开这一层请先用 simulate 拿自己的说法试几条。
+#   （0.3.4 因此没有在内嵌权重的包里默认打开它。）
+#   好消息：句首否定在意图层就被拦下了，「不要打开计算器」「别关微信」不会走到这里。
+#
+# 官方 benchmark 里 20 选项意图任务是 0.451 —— 它只该兜住第 0 层漏掉的输入，
+# 不该当主判据。
 #
 # ⚠ 这一层**需要 torch（约 500MB）**，哪怕权重是 ONNX 的：laya.onnx_agent 会
 #   顶层 import laya.common，而 laya.common 第 13 行就是 import torch。
 #   所以默认的精简版 exe 开不了它（报 No module named 'torch'，装 pip 包也修不了）
 #   ——要用它请跑源码版，或按 VOICE_CTL_BUNDLE_DECISION=1 重新打包。
+#   0.3.4 起还有 VOICE_CTL_BUNDLE_DECISION_WEIGHTS=1 可以把 906MB 权重一起内嵌。
 enabled = false
 model = "multilingual"     # 中文务必用 multilingual；english checkpoint 中文接近随机
-min_confidence = 0.6       # 低于此值不执行，只提示。实测负样本正好落在 0.589
+min_confidence = 0.6       # 在 5 候选下负样本落在 0.589；21 动作下见上面的警告
 onnx_dir = "models/laya-onnx/multilingual"
 
 [web]

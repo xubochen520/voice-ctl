@@ -110,6 +110,19 @@ VERSIONS = [
             "full": ROOT / "dist-full" / "voice-ctl.exe",
         },
     ),
+    (
+        "v0.3.4",
+        "voice-ctl 0.3.4 —— 语义模型内置，装完就能用",
+        "docs/RELEASE-NOTES-0.3.4.md",
+        {
+            "lite": ROOT / "dist" / "voice-ctl.exe",
+            "full": ROOT / "dist-full" / "voice-ctl.exe",
+            # 语义版是**目录版**（1.4GB 不能每次启动解包），所以挂的是 zip。
+            # 名字里的 .zip 不能省：资产名和内容对不上时用户会双击一个压缩包
+            # 却以为是 exe。
+            "semantic": ROOT / "dist-semantic" / "voice-ctl-semantic.zip",
+        },
+    ),
 ]
 
 
@@ -137,7 +150,9 @@ def main() -> int:
             print(f"  -> {rel['html_url']}")
         have = {a["name"] for a in rel.get("assets", [])}
         for kind, path in assets.items():
-            fname = f"voice-ctl-{tag.lstrip('v')}-win64-{kind}.exe"
+            # 后缀跟**源文件**走，不硬编码 .exe：语义版是 1.8GB 的目录版，
+            # 挂的是 zip。硬编码 .exe 会让用户双击一个压缩包却以为是可执行文件。
+            fname = f"voice-ctl-{tag.lstrip('v')}-win64-{kind}{path.suffix}"
             if fname in have:
                 print(f"    {fname} 已存在，跳过")
                 continue

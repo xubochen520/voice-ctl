@@ -6,6 +6,9 @@
     VOICE_CTL_BUNDLE_MODEL=1    把 226MB 识别模型打进 exe（完整版，免下载）
     VOICE_CTL_BUNDLE_LLAMA=1    把 39.8MB llama.cpp 运行时打进 exe（内置小模型层的二进制）
     VOICE_CTL_BUNDLE_LLM_MODEL=1 连 GGUF 模型也打进去（469MB，慎用，见下）
+    VOICE_CTL_BUNDLE_DECISION=1 把 Laya 语义层打进去（含 torch/transformers 约 600MB）
+    VOICE_CTL_BUNDLE_DECISION_WEIGHTS=1  连 873MB ONNX 权重也打进去（0.3.4 新增）
+    VOICE_CTL_DECISION_WEIGHTS=<路径>     权重的来源目录，默认 models/laya-onnx/multilingual
     默认                        都不打（精简版，首次按需下载）
 
 关于 llama.cpp 的三个变体（0.3.1 新增）：
@@ -49,6 +52,15 @@ BUNDLE_MODEL = os.environ.get("VOICE_CTL_BUNDLE_MODEL", "0") == "1"
 BUNDLE_LLAMA = os.environ.get("VOICE_CTL_BUNDLE_LLAMA", "0") == "1"
 BUNDLE_LLM_MODEL = os.environ.get("VOICE_CTL_BUNDLE_LLM_MODEL", "0") == "1"
 BUNDLE_DECISION = os.environ.get("VOICE_CTL_BUNDLE_DECISION", "0") == "1"
+# 语义层的 873MB ONNX 权重单独一个开关（0.3.4 新增）：torch 那 500MB 和权重
+# 这 873MB 是两件事，有时只想要其中一件（比如想验证"权重打进去了没有"而
+# 不想再等 torch 那一份）。BUNDLE_DECISION_WEIGHTS=1 但 BUNDLE_DECISION=0
+# 是允许的——那会打一份有权重却没 torch 的包，语义层加载会失败，
+# 但 doctor 能看出权重在哪，适合排查路径问题。
+BUNDLE_DECISION_WEIGHTS = os.environ.get("VOICE_CTL_BUNDLE_DECISION_WEIGHTS", "0") == "1"
+DECISION_WEIGHTS_SRC = os.environ.get(
+    "VOICE_CTL_DECISION_WEIGHTS", "models/laya-onnx/multilingual"
+)
 ROOT = os.path.abspath(os.getcwd())
 
 datas = [
@@ -61,6 +73,40 @@ if BUNDLE_MODEL:
     model_dir = os.path.join(ROOT, "models", "sense-voice-int8")
     if os.path.isdir(model_dir):
         datas.append((model_dir, "models/sense-voice-int8"))
+
+# --- 语义层权重（873MB） ----------------------------------------------------- #
+#
+# 和 ASR 模型同一套机制：打进包 -> 启动时落在 `_MEIPASS` -> 运行时由
+# `bootstrap.resolve_decision_dir()` 兜底找到。**这个兜底是不可省的**——
+# 配置里的 `[decision].onnx_dir` 是相对路径，按配置文件所在目录解析，
+# 而打包后那份 config.toml 在 exe 同级，那里没有权重。早先版本没有这个
+# 兜底函数，所以"把权重打进包"会毫无效果（程序照样报"缺少 *.onnx"）。
+#
+# 体积上这是 unfriendly 的一档：权重 873MB + torch 约 500MB。所以必须出
+# **目录版**（onedir），单文件版每次启动都要把这 873MB 解到临时目录。
+if BUNDLE_DECISION_WEIGHTS:
+    _wsrc = os.path.join(ROOT, DECISION_WEIGHTS_SRC.replace("/", os.sep))
+    if os.path.isdir(_wsrc):
+        _graph = [f for f in os.listdir(_wsrc) if f.endswith(".onnx")]
+        if _graph:
+            _mb = sum(
+                os.path.getsize(os.path.join(_dp, _fn))
+                for _dp, _dn, _fns in os.walk(_wsrc)
+                for _fn in _fns
+            ) / 1024 / 1024
+            # 目标路径必须和 resolve_decision_dir() 里找的那两条一致
+            datas.append((_wsrc, "models/laya-onnx/multilingual"))
+            print(
+                f"[spec] 内嵌语义层权重：{_wsrc} -> models/laya-onnx/multilingual"
+                f"（{_mb:.0f}MB，{_graph[0]}）"
+            )
+        else:
+            print(f"[spec] 警告：{_wsrc} 里没有 .onnx 图，权重不完整，跳过")
+    else:
+        print(
+            f"[spec] 警告：要内嵌语义层权重但目录不存在：{_wsrc}\n"
+            "        先跑 `voice-ctl fetch-decision`，或用 VOICE_CTL_DECISION_WEIGHTS 指到别处。"
+        )
 
 # --- llama.cpp 运行时 ------------------------------------------------------- #
 #
@@ -130,6 +176,20 @@ if BUNDLE_DECISION:
             binaries += collect_dynamic_libs(_pkg)
         except Exception as _e:  # noqa: BLE001
             print(f"[spec] 警告：收集 {_pkg} 动态库失败：{_e}")
+
+# torch 的动态库会被上面两处各收一次（onnxruntime 的也是），重复项会让
+# Analysis 报 "duplicate entries"。按 (dest 路径) 去重，保留先出现的那个。
+_seen_bin: set = set()
+_dedup_binaries = []
+for _b in binaries:
+    _key = _b[0] if isinstance(_b, (tuple, list)) else _b
+    if _key in _seen_bin:
+        continue
+    _seen_bin.add(_key)
+    _dedup_binaries.append(_b)
+if len(_dedup_binaries) != len(binaries):
+    print(f"[spec] 动态库去重：{len(binaries)} -> {len(_dedup_binaries)}")
+binaries = _dedup_binaries
 
 hiddenimports = [
     "voice_ctl",
@@ -254,8 +314,11 @@ pyz = PYZ(a.pure)
 # 语义层那 600MB 每次启动都要解到临时目录，单文件根本不适合装它：实测
 # `--version` 从 4.3s 变成 20.8s。所以这个变体默认出**目录版**（onedir）——
 # 文件就在 exe 旁边，启动时不用解包。要单文件还是可以显式 ONE_FILE=1。
+#
+# 同理，873MB 权重也必须走目录版：单文件版每次启动都要把它解到临时目录，
+# 那是 873MB 的写入，启动时间和磁盘磨损都不可接受。
 ONE_FILE = os.environ.get("VOICE_CTL_ONE_FILE", "1") == "1"
-if BUNDLE_DECISION and os.environ.get("VOICE_CTL_ONE_FILE") is None:
+if (BUNDLE_DECISION or BUNDLE_DECISION_WEIGHTS) and os.environ.get("VOICE_CTL_ONE_FILE") is None:
     ONE_FILE = False
 
 if ONE_FILE:

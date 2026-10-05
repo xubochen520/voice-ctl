@@ -16,7 +16,7 @@ from . import __version__
 from .asr import AsrError
 from .config import AppConfig, ConfigError, load_config
 from .recorder import Recorder, RecorderError, list_input_devices, play_beep
-from .runner import Engine, Runtime, build_runtime, model_dir_for
+from .runner import Engine, Runtime, build_runtime, decision_dir_for, model_dir_for
 
 __all__ = [
     "Runtime",
@@ -103,10 +103,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print("\n--- 语义层 ---")
     from .decision import available
 
-    wdir = cfg.decision_path()
+    wdir = decision_dir_for(cfg)
     ok, reason = available(wdir)
     print(f"{'✓' if ok else '·'} {reason}")
-    print(f"  权重目录：{wdir}")
+    bundled = wdir != cfg.decision_path()
+    print(f"  权重目录：{wdir}" + ("  （打包内嵌，不用下载）" if bundled else ""))
     if not ok:
         print("  下载：voice-ctl fetch-decision   （约 900MB，中文务必用 multilingual）")
         if cfg.decision.enabled:
@@ -236,19 +237,64 @@ def cmd_fetch_decision(args: argparse.Namespace) -> int:
     官方仓库不发布 ONNX 图，所以图取自社区导出；config 和 tokenizer 走官方仓库
     （必须同源，否则 tokenizer 与权重不匹配）。中文务必选 multilingual。
     """
+    from . import bootstrap
     from .decision import WEIGHTS, DecisionUnavailable, fetch_weights
 
     try:
         cfg = load_config(args.config)
-        root = cfg.decision.onnx_dir
     except ConfigError:
-        root = args.dir or "models/laya-onnx"
+        cfg = None
 
     which = args.model
     spec = WEIGHTS.get(which)
     if spec is None:
         print(f"✗ 不认识 {which!r}；可选：{', '.join(WEIGHTS)}")
         return 2
+
+    # 先问一次"这一层现在能不能用"，答案决定两件事：能不能短路、要不要警告。
+    # 判据必须用 decision_dir_for——只看配置里的相对路径会把内嵌那份漏掉，
+    # 于是"明明已经内置了"还提示用户去下 900MB。
+    usable, why = False, ""
+    if cfg is not None:
+        from .decision import available as _dec_available
+
+        usable, why = _dec_available(decision_dir_for(cfg))
+
+    force = getattr(args, "force", False)
+
+    if usable and not force:
+        # 已经有了（内嵌的，或用户先前下好的），别再下 900MB
+        print(f"✓ 语义层权重已就绪，无需下载：\n  {why}")
+        print("  想强制重下加 --force；想下到别处用 --dir。")
+        return 0
+
+    # 这个构建**根本加载不了**语义层时（精简版没带 torch/laya），必须在下 906MB
+    # **之前**说清楚。实测过这个坑：精简版会老老实实下完 906MB、报"✓ 权重就绪"，
+    # 然后用户跑 simulate 才发现 "No module named 'torch'"——906MB 白下，
+    # 而且报错发生在最不该发生的时候（用户以为已经装好了）。
+    #
+    # `why` 以"缺少"开头的情况是权重不存在（可以靠下载解决），不算这一档；
+    # 其余都是"这个构建缺依赖/缺模块"，下载解决不了。
+    if cfg is not None and not usable and not force and not why.startswith("缺少"):
+        print(f"⚠ 这个构建加载不了语义层：\n  {why}\n")
+        print("  也就是说：下面这 906MB 下完之后**仍然用不了**。")
+        print("  想真正启用语义层，得换一个带语义层的构建")
+        print("  （VOICE_CTL_BUNDLE_DECISION=1 重新打包），或直接跑源码版。")
+        print("  权重本身没问题——只是这个 exe 缺了它需要的那一半。\n")
+        try:
+            ans = input("仍然下载？[y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans not in ("y", "yes", "是"):
+            print("已取消，什么都没下。")
+            return 0
+
+    # 落盘位置：显式 --dir 优先；否则钉在可写数据目录下，
+    # 绝不落到 cwd——用户可能在 C:\Windows\System32 里跑这个命令。
+    if args.dir:
+        root = Path(args.dir).expanduser()
+    else:
+        root = bootstrap.data_dir() / "models" / "laya-onnx"
 
     print(f"下载 Laya ONNX 权重 → {root}")
     print(f"  checkpoint : {which}")
@@ -788,12 +834,14 @@ def build_parser() -> argparse.ArgumentParser:
         "fetch-decision",
         help="下载 Laya 语义层 ONNX 权重（可选功能，约 900MB）",
     )
-    sp.add_argument("--dir", default=None, help="目标目录（默认取 [decision].onnx_dir）")
-    sp.add_argument(
-        "--model",
+    sp.add_argument("--dir", default=None,
+                    help="目标目录（默认落在可写数据目录的 models/laya-onnx 下）")
+    sp.add_argument("--model",
         default="multilingual",
         help="要哪个 checkpoint（默认 multilingual；中文别用 english）",
     )
+    sp.add_argument("--force", action="store_true",
+                    help="即使权重已就绪也重新下载")
     sp.set_defaults(func=cmd_fetch_decision)
 
     sp = sub.add_parser("test", help="用自带样例音频验证识别")

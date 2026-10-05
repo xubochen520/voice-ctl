@@ -16,11 +16,15 @@ llm/
 build/
 build-full/
 build-decision/
+build-lite/
+build-semantic/
 dist/
 dist-full/
 dist-decision/
 dist-new/
 dist-full-new/
+dist-semantic/
+build-*.log
 *.pdb
 
 # 临时探针脚本（诊断完就删，别混进版本库）

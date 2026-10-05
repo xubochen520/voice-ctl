@@ -1,16 +1,17 @@
 # 打包成 Windows exe
 
-用 PyInstaller 出单文件 exe。两个变体：
+用 PyInstaller 出单文件 exe。三个变体：
 
 | 变体 | 体积 | 首次使用 | 启动耗时 | 适合谁 |
 |---|---|---|---|---|
 | **lite** | 84.1 MB | 需跑一次 `download`（226MB） | **2.4s** | 日常使用（模型放 exe 旁边，启动不解包） |
 | **full** | 236.1 MB | 开箱即用 | 3.8s | 想零配置、或不方便单独下模型 |
+| **semantic** | 约 1.4 GB | **完全离线**，什么都不用下 | 目录版，与 full 同级 | 要用语义层、且要求全程不联网 |
 
-两者功能完全一致，只差识别模型是否内嵌。**常用建议选 lite**：虽然要多下一次，
+前两者功能一致，只差识别模型是否内嵌。**常用建议选 lite**：虽然要多下一次，
 但每次启动快一倍——`full` 每次运行都要把 226MB 解包到临时目录。
 
-（0.3.1 起两个变体都内嵌了 39.8MB 的 llama.cpp 运行时，见下。）
+（0.3.1 起这些变体都内嵌了 39.8MB 的 llama.cpp 运行时，见下。）
 
 ## 构建
 
@@ -29,19 +30,49 @@ Remove-Item Env:\VOICE_CTL_BUNDLE_LLAMA
 $env:VOICE_CTL_BUNDLE_MODEL='1'; $env:VOICE_CTL_BUNDLE_LLAMA='1'
 .venv\Scripts\python -m PyInstaller voice-ctl.spec --noconfirm --distpath dist-full --workpath build-full
 Remove-Item Env:\VOICE_CTL_BUNDLE_MODEL
+
+# 语义版（0.3.4）：权重也内置，出来是**目录版**
+$env:VOICE_CTL_BUNDLE_MODEL='1'; $env:VOICE_CTL_BUNDLE_LLAMA='1'
+$env:VOICE_CTL_BUNDLE_DECISION='1'; $env:VOICE_CTL_BUNDLE_DECISION_WEIGHTS='1'
+.venv\Scripts\python -m PyInstaller voice-ctl.spec --noconfirm --distpath dist-semantic --workpath build-semantic
 ```
 
-产物：`dist\voice-ctl.exe` / `dist-full\voice-ctl.exe`。
+产物：`dist\voice-ctl.exe` / `dist-full\voice-ctl.exe` / `dist-semantic\voice-ctl\voice-ctl.exe`。
 
-## 四个打包开关
+## 五个打包开关
 
 | 环境变量 | 内容 | 建议 |
 |---|---|---|
 | `VOICE_CTL_BUNDLE_LLAMA` | 39.8MB llama.cpp 运行时 | **打**——它是"内置小模型层"的前提，而从 GitHub 下载要用户能访问 github.com |
-| `VOICE_CTL_BUNDLE_LLM_MODEL` | 469MB~1GB 的 GGUF 模型 | **别打**——单文件 exe 每次启动都要解包它 |
+| `VOICE_CTL_BUNDLE_LLM_MODEL` | 469MB~1GB 的 GGUF 模型 | **别打**——每次启动都要解包它 |
 | `VOICE_CTL_BUNDLE_MODEL` | 226MB 识别模型 | 看情况（`full` 变体就是它） |
-| `VOICE_CTL_BUNDLE_DECISION` | torch + transformers + laya，约 600MB | **默认别打**——只有要开 Laya 语义层才需要 |
+| `VOICE_CTL_BUNDLE_DECISION` | torch + transformers + laya，约 600MB | 只有要开 Laya 语义层才需要 |
+| `VOICE_CTL_BUNDLE_DECISION_WEIGHTS` | 906MB ONNX 权重 | 要"装完即用、不联网"就打；否则让用户 `voice-ctl fetch-decision` |
+| `VOICE_CTL_DECISION_WEIGHTS` | 权重的**来源**目录 | 默认 `models/laya-onnx/multilingual`；想用别处的权重时指过去 |
+| `VOICE_CTL_ONE_FILE` | 强制单文件 | 语义层/权重变体默认**目录版**，别强行单文件（见下） |
 | （依赖）`psutil` | 约 0.1MB | **打**——关闭应用靠它列进程，16ms vs WMI 的 677ms |
+
+### 内嵌权重必须配合路径兜底（0.3.4）
+
+**这是最容易做错的一处，做错了表现是"打了包但完全没效果"。**
+
+配置里的 `[decision].onnx_dir` 是相对路径，`cfg.decision_path()` 按**配置文件
+所在目录**解析。打包后那份 config.toml 在 exe 同级，那里没有权重——权重在
+`_MEIPASS` 里。所以只加打包开关、不加兜底函数，程序照样报「缺少 *.onnx」，
+而且报错完全不指向真因（用户会以为是自己没下权重）。
+
+ASR 模型一直有 `bootstrap.resolve_model_dir()` 这个兜底，语义层在 0.3.4 才补上
+`bootstrap.resolve_decision_dir()`，优先级：
+
+```
+配置指向的目录存在      → 用它（源码运行、或用户自己下了权重）
+exe 同级 models/...     → 用它（用户手动放进来，可换掉内置那份而不必重新打包）
+_MEIPASS/models/...     → 用它（打包内嵌的那份）
+都没有                  → 原样返回，报"缺少权重"并给下载指引
+```
+
+改打包路径时（spec 里的 `models/laya-onnx/multilingual`）**必须同步改**
+`resolve_decision_dir()` 里找的那两条，否则又变成白打。
 
 ### 为什么语义层要单独一个开关（0.3.2 更正）
 
@@ -75,10 +106,46 @@ torch 的 DLL 全在 `torch/lib/` 下（9 个共 314MB），`collect_dynamic_lib
 会把它们放到 `torch/lib/`——**必须显式收集**，缺 `c10.dll` 时是启动即崩，
 而报错完全不指向真因。
 
+### torch 到底用在哪（0.3.4 量过）
+
+做这个判断时我试过"能不能不打包 torch"，结论值得记下来，免得下次重复劳动。
+
+**ONNX 图里已经到动作头了**，图的输出是：
+
+```
+输入: input_ids, attention_mask, marker_pos, marker_mask, qtype
+输出: logits (batch, markers)      ← marker 打分
+      act_logits (batch, 2)        ← 动作分布
+```
+
+而 `laya/common.py` 的 `DecisionModel.forward()` 算的就是这两件事。
+所以**纯推理不需要 torch 做任何计算**，它是 import 链上的负债。
+
+**但 laya 包脱离 torch 加载不了**，卡点三层（用桩实验逐层试出来的）：
+
+1. `common.py:472` 模块级 `class DecisionModel(nn.Module)`、
+   `_DynamicMultiheadAttention(nn.MultiheadAttention)` —— 光**继承**就要真 torch
+   （桩得支持 `__mro_entries__` 才能过）
+2. `onnx_agent.py` 没有 `from __future__ import annotations`，所以类型注解是
+   **运行时求值**的，会碰 `torch.FloatTensor` 参与 `|` 运算
+   （桩得支持 `__or__` / `__ror__` / `__getitem__` 才能过）
+3. `transformers` 的懒加载用 `is_torch_available()` 判断后端
+   （`AutoTokenizer` → `GenerationMixin`）——它要**真 torch**，不是"能导入的假模块"
+
+前两层桩能过，第三层过不去。真想做"零 torch 语义层"，正确路子是
+**绕开 laya 自己跑 ONNX**（图输入输出已量清，缺的只有 `common.py` 里的
+tokenize / marker 拼装 / 解码，全是纯 Python 算术），而不是想办法骗过
+`is_torch_available()`。这条留给以后需要缩体积时做。
+
 **为什么 GGUF 不该打进 exe**：PyInstaller 的单文件 exe 每次启动都把内嵌数据
 解包到临时目录。0.2.0 实测过这条路的代价——226MB 的识别模型让启动从 1.7s
 变成 3.1s。469MB 只会更糟，而且是**每次启动**都白写 469MB 到磁盘。
-让用户下一次，比每次启动都解包划算。同一条理由也适用于语义层那 600MB。
+让用户下一次，比每次启动都解包划算。
+
+同一条理由决定了**语义层那 600MB + 873MB 权重必须走目录版**：spec 里
+`BUNDLE_DECISION` 或 `BUNDLE_DECISION_WEIGHTS` 任一打开、且没显式设
+`VOICE_CTL_ONE_FILE` 时，自动切成 onedir。单文件版实测过——`--version`
+从 4.3s 变成 20.8s，而 873MB 权重只会更糟。
 
 **为什么运行时可以打**：内嵌的是 22 个 DLL，只有真的开出小模型层才会被加载。
 不开的话它们只是磁盘上的几行目录项。

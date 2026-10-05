@@ -101,6 +101,17 @@ def model_dir_for(cfg: AppConfig) -> Path:
     return bootstrap.resolve_model_dir(cfg.model_path())
 
 
+def decision_dir_for(cfg: AppConfig) -> Path:
+    """语义层权重目录，含「打包内嵌权重」兜底。
+
+    和 `model_dir_for` 同一个道理：cfg.decision_path() 只做相对路径拼接，
+    不知道权重可能被内嵌在 _MEIPASS 里。所有读权重的地方都该用这个函数。
+    """
+    from . import bootstrap
+
+    return bootstrap.resolve_decision_dir(cfg.decision_path())
+
+
 def build_runtime(
     cfg: AppConfig,
     *,
@@ -149,7 +160,9 @@ def build_runtime(
         from .decision import DecisionUnavailable, SemanticDecider
 
         try:
-            decider = SemanticDecider(cfg.enabled_actions, cfg.decision, root=cfg.decision_path())
+            decider = SemanticDecider(
+                cfg.enabled_actions, cfg.decision, root=decision_dir_for(cfg)
+            )
             decider.load()
         except DecisionUnavailable as e:
             (bus or events.get_bus()).emit(
