@@ -20,16 +20,19 @@
 
 ## 下载
 
-最新版 **[v0.3.4](https://github.com/xubochen520/voice-ctl/releases/latest)**：
+最新版 **[v0.3.5](https://github.com/xubochen520/voice-ctl/releases/latest)**：
 
 | 产物 | 体积 | 说明 |
 |---|---|---|
-| [voice-ctl-0.3.4-win64-lite.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.4/voice-ctl-0.3.4-win64-lite.exe) | 84MB | **推荐**。首次用要跑一次 `voice-ctl download` 拉识别模型（226MB），之后每次启动都快一倍 |
-| [voice-ctl-0.3.4-win64-full.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.4/voice-ctl-0.3.4-win64-full.exe) | 236MB | 开箱即用，识别模型内嵌。代价是每次启动都要把 226MB 解包到临时目录 |
-| `voice-ctl-0.3.4-win64-semantic.zip` | 约 1.8GB | **完全离线**：连语义层和 906MB 权重都内置，什么都不用下。目录版（解压即用） |
+| [voice-ctl-0.3.5-win64-lite.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.5/voice-ctl-0.3.5-win64-lite.exe) | 84MB | **推荐**。首次用要跑一次 `voice-ctl download` 拉识别模型（226MB），之后每次启动都快一倍 |
+| [voice-ctl-0.3.5-win64-full.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.5/voice-ctl-0.3.5-win64-full.exe) | 236MB | 开箱即用，识别模型内嵌。代价是每次启动都要把 226MB 解包到临时目录 |
+| `voice-ctl-0.3.5-win64-semantic.zip` | 1.4GB | **完全离线**：连语义层和 906MB 权重都内置，什么都不用下。目录版（解压即用） |
 
 前两个都是单文件 exe，双击就出界面（命令行也一样用）。功能完全相同，只差识别模型是否内嵌。
 语义版是目录版，因为 1.8GB 每次启动都解包到临时目录不可接受。
+
+**要用语义层只有 `semantic` 那个包可以**——前两个没带 torch（约 500MB），开语义层会报
+`No module named 'torch'`。这是体积取舍，不是缺陷。
 
 从源码跑：
 
@@ -37,6 +40,23 @@
 pip install -e .
 voice-ctl ui
 ```
+
+---
+
+## 0.3.5：修掉「从界面点下载，906MB 白下」
+
+0.3.4 修了 `voice-ctl fetch-decision`：构建加载不了语义层时，下载**之前**劝阻。
+但只修了 CLI 那一半——界面「设置」页那个下载按钮走的是**另一份**代码，
+没有那道检查，而且落盘还在用原始相对路径（会落到当前工作目录）。
+
+用户实测撞到：跑完整版（不带语义层），从界面点下载，老实下完 906MB，
+开语义层才看到 `No module named 'torch'`。
+
+现在判断抽成一份 `decision.preflight_fetch()`，CLI 和界面共用。
+界面那边**直接拒绝**并说清该换哪个构建——点一个按钮就该是有效动作，
+弹「要不要继续」然后照样下 906MB 算不上保护。
+
+详见 [0.3.5 版本说明](docs/RELEASE-NOTES-0.3.5.md)。
 
 ---
 

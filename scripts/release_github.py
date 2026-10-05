@@ -117,9 +117,19 @@ VERSIONS = [
         {
             "lite": ROOT / "dist" / "voice-ctl.exe",
             "full": ROOT / "dist-full" / "voice-ctl.exe",
-            # 语义版是**目录版**（1.4GB 不能每次启动解包），所以挂的是 zip。
-            # 名字里的 .zip 不能省：资产名和内容对不上时用户会双击一个压缩包
-            # 却以为是 exe。
+            # 语义版是**目录版**（目录 1.8GB、zip 1.4GB，不能每次启动解包），
+            # 所以挂的是 zip。名字里的 .zip 不能省：资产名和内容对不上时
+            # 用户会双击一个压缩包却以为是 exe。
+            "semantic": ROOT / "dist-semantic" / "voice-ctl-semantic.zip",
+        },
+    ),
+    (
+        "v0.3.5",
+        "voice-ctl 0.3.5 —— 修掉「从界面点下载，906MB 白下」",
+        "docs/RELEASE-NOTES-0.3.5.md",
+        {
+            "lite": ROOT / "dist" / "voice-ctl.exe",
+            "full": ROOT / "dist-full" / "voice-ctl.exe",
             "semantic": ROOT / "dist-semantic" / "voice-ctl-semantic.zip",
         },
     ),

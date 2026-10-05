@@ -470,14 +470,43 @@ class SettingsTab(tk.Frame):
         self._refresh_facts()
 
     def _download_decision(self) -> None:
-        from ..decision import WEIGHTS, fetch_weights
+        """下载语义层权重。
+
+        判断全部走 decision.preflight_fetch —— CLI 的 fetch-decision 调的是同一个
+        函数。以前这里自己写了一遍，而且漏了两件：
+          1. 没判断"这个构建加载不了语义层"。实测撞到过：完整版（不带 torch）
+             从界面点下载，老实下完 906MB，用户开语义层才看到 No module named 'torch'。
+          2. 落盘用的是 self._onnx_dir.get() **原始字符串**——那是相对路径，
+             相对配置文件所在目录才对，直接 mkdir 会相对**当前工作目录**。
+        """
+        from ..decision import WEIGHTS, fetch_weights, preflight_fetch
 
         which = self._decision_model.get() or "multilingual"
         spec = WEIGHTS.get(which)
         if spec is None:
             events.error(f"不认识 {which!r}；可选：{', '.join(WEIGHTS)}", kind="download")
             return
-        root = self._onnx_dir.get().strip() or "models/laya-onnx/multilingual"
+
+        plan = preflight_fetch(self._onnx_dir.get().strip())
+
+        if plan.already_ready:
+            where = "（打包内嵌）" if plan.bundled else ""
+            events.ok(f"语义层权重已就绪，无需下载{where}：{plan.target}", kind="download")
+            return
+
+        if not plan.allowed:
+            # 不能弹一个"要不要继续"的对话框然后照样下 906MB——界面上的按钮
+            # 点下去就该是有效动作。这里直接拒绝，并说清换哪个构建。
+            events.error(f"这个构建加载不了语义层：{plan.reason}", kind="download")
+            events.warn(
+                "这 906MB 下完仍然用不了——缺的是 torch/laya，不是权重。"
+                "要用语义层请换带语义层的构建（VOICE_CTL_BUNDLE_DECISION=1 打包），"
+                "或直接跑源码版。",
+                kind="download",
+            )
+            return
+
+        root = plan.target
 
         def work() -> None:
             try:
@@ -489,7 +518,7 @@ class SettingsTab(tk.Frame):
                 self._reload_after = "decision"
 
         events.info(
-            f"开始下载语义层权重 {which}（约 900MB，来自 {spec['repo']}），进度见「日志」页",
+            f"开始下载语义层权重 {which}（约 900MB，来自 {spec['repo']}）→ {root}，进度见「日志」页",
             kind="download",
         )
         threading.Thread(target=work, name="voice-ctl-fetch-decision", daemon=True).start()

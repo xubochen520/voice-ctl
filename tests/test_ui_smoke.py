@@ -17,101 +17,11 @@ from pathlib import Path
 
 import pytest
 
-tk = pytest.importorskip("tkinter")
+# 无图形环境（CI、远程会话）时整体跳过。fixture 都在 conftest.py 里。
+pytest.importorskip("tkinter")
 
 from voice_ctl import events  # noqa: E402
 from voice_ctl.config import load_config  # noqa: E402
-from voice_ctl.ui import theme  # noqa: E402
-
-MINIMAL = """
-[hotkey]
-keys = "<ctrl>+<alt>+space"
-min_duration_ms = 200
-max_duration_ms = 15000
-
-[audio]
-samplerate = 16000
-channels = 1
-min_peak = 0.01
-
-[model]
-dir = "models/sense-voice-int8"
-language = "auto"
-use_itn = true
-num_threads = 2
-provider = "cpu"
-
-[match]
-threshold = 80
-
-[feedback]
-beep = false
-
-[[action]]
-id = "open.notepad"
-handler = "open_app"
-aliases = ["记事本", "notepad"]
-describe = "打开记事本"
-target = "notepad.exe"
-
-[[action]]
-id = "sys.mute"
-handler = "sysctl"
-aliases = ["静音"]
-describe = "系统静音"
-target = "mute"
-
-[[action]]
-id = "off.example"
-handler = "open_app"
-aliases = ["停用的"]
-target = "calc.exe"
-enabled = false
-"""
-
-
-@pytest.fixture()
-def cfg_path(tmp_path: Path) -> Path:
-    p = tmp_path / "config.toml"
-    p.write_text(MINIMAL, encoding="utf-8")
-    return p
-
-
-@pytest.fixture(scope="module")
-def tcl_root():  # noqa: ANN201
-    """整个模块共用一个 Tcl 解释器。
-
-    每个测试都 Tk()/destroy() 的话，Tcl 会反复 Init/Finalize，跑几次之后
-    连自己的 init.tcl 都找不到（"Can't find a usable init.tcl"）——在全量
-    测试里表现为随机一个 UI 测试报错，单独跑这个文件却是绿的。
-    """
-    try:
-        # DPI 感知必须在 Tk() 之前声明，否则 winfo_fpixels 拿到的是被虚拟化的值
-        theme.enable_dpi_awareness()
-        root = tk.Tk()
-    except tk.TclError as e:  # pragma: no cover - 无图形环境
-        pytest.skip(f"没有可用的图形环境：{e}")
-    root.withdraw()
-    yield root
-    try:
-        root.destroy()
-    except tk.TclError:  # pragma: no cover
-        pass
-
-
-@pytest.fixture()
-def app(cfg_path: Path, tcl_root):  # noqa: ANN001, ANN201
-    from voice_ctl.ui.window import build_window
-
-    win = tk.Toplevel(tcl_root)
-    win.withdraw()
-    a = build_window(load_config(cfg_path), cfg_path, root=win)
-    yield a
-    try:
-        a.on_close()
-    except tk.TclError:  # pragma: no cover
-        pass
-    events.get_bus().close(0.2)
 
 
 def pump(app, n: int = 6) -> None:  # noqa: ANN001

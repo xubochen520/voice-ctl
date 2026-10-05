@@ -201,8 +201,9 @@ def test_fetch_decision_force_bypasses_short_circuit(monkeypatch: pytest.MonkeyP
 def test_fetch_decision_lands_in_data_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
     """没给 --dir 时落盘位置必须是可写数据目录，不能是 cwd。
 
-    旧实现用 cfg.decision.onnx_dir 原始字符串，相对路径会落到当前工作目录
-    ——用户可能从 C:\\Windows\\System32 里跑这个命令。
+    旧实现（CLI 和界面各一份）拿配置里的**原始相对字符串**直接去 mkdir，
+    那是相对**当前工作目录**的——用户从 C:\\Windows\\System32 里跑一次，
+    906MB 就下到那儿了。
     """
     import argparse
 
@@ -224,8 +225,122 @@ def test_fetch_decision_lands_in_data_dir(monkeypatch: pytest.MonkeyPatch, tmp_p
 
     assert seen, "应当发起下载"
     assert seen[0].is_absolute()
+    # 必须挂在可写数据目录下，而不是 Path.cwd()
     assert str(tmp_path / "writable") in str(seen[0])
-    assert seen[0] == tmp_path / "writable" / "models" / "laya-onnx"
+    assert not str(seen[0]).startswith(str(Path.cwd() / "models"))
+
+
+# --------------------------------------------------------------------------- #
+# preflight_fetch：CLI 和界面共用的一份判断（分叉就是缺陷来源）
+# --------------------------------------------------------------------------- #
+
+
+def test_preflight_ready_when_bundled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """内嵌了权重 -> already_ready + bundled，调用方不该再下。
+
+    这里**直接钉死 resolve_decision_dir 的返回值**：本仓库里真实存在
+    `models/laya-onnx/multilingual`，走真解析会在第一条（配置目录存在）
+    就命中，于是永远测不到内嵌那条分支——一条"碰巧通过"的测试比没有更糟，
+    因为它会让人以为内嵌路径被覆盖了。
+    """
+    from voice_ctl.decision import preflight_fetch
+
+    data = tmp_path / "data"
+    bundle = tmp_path / "bundle"
+    data.mkdir()
+    bundled = _make_weights(bundle / REL)
+    monkeypatch.setattr(bootstrap, "data_dir", lambda: data)
+    monkeypatch.setattr(bootstrap, "resolve_decision_dir", lambda configured: bundled)
+
+    plan = preflight_fetch("models/laya-onnx/multilingual")
+    assert plan.already_ready
+    assert plan.allowed
+    assert plan.bundled, "应当标出这是内嵌的那份"
+    assert plan.target == bundled.resolve()
+
+
+def test_preflight_not_bundled_when_config_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """权重是用户自己下的（解析结果就是配置那个）-> 不该标 bundled。"""
+    from voice_ctl.decision import preflight_fetch
+
+    mine = _make_weights(tmp_path / REL)
+    monkeypatch.setattr(bootstrap, "resolve_decision_dir", lambda configured: mine)
+
+    plan = preflight_fetch(str(mine))
+    assert plan.already_ready
+    assert not plan.bundled
+
+
+def test_preflight_blocks_when_build_cannot_load(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """构建缺依赖（不是缺权重）-> allowed=False。
+
+    这条是用户实测撞到的：完整版（不带 torch）从界面点下载，老实下完 906MB，
+    用户开语义层才看到 No module named 'torch'。
+    """
+    from voice_ctl import decision
+    from voice_ctl.decision import preflight_fetch
+
+    monkeypatch.setattr(
+        decision, "available",
+        lambda root: (False, "这个精简版 exe 没带语义层（No module named 'torch'）"),
+    )
+    monkeypatch.setattr(bootstrap, "data_dir", lambda: tmp_path / "data")
+
+    plan = preflight_fetch("models/laya-onnx/multilingual")
+    assert not plan.allowed
+    assert not plan.already_ready
+    assert plan.target is None
+    assert "torch" in plan.reason
+
+
+def test_preflight_allows_when_only_weights_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """只有权重缺失（构建是好的）-> allowed=True，目标挂在数据目录下。"""
+    from voice_ctl import decision
+    from voice_ctl.decision import preflight_fetch
+
+    monkeypatch.setattr(decision, "available", lambda root: (False, "缺少 *.onnx（模型图）"))
+    monkeypatch.setattr(bootstrap, "data_dir", lambda: tmp_path / "data")
+
+    plan = preflight_fetch("models/laya-onnx/multilingual")
+    assert plan.allowed
+    assert not plan.already_ready
+    # 相对路径按目录名挂到数据目录下，绝不能是 cwd
+    assert plan.target == (tmp_path / "data" / "models" / "laya-onnx" / "multilingual").resolve()
+
+
+def test_preflight_absolute_path_used_as_is(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """配置给的是绝对路径 -> 就用它（用户显式指定）。"""
+    from voice_ctl import decision
+    from voice_ctl.decision import preflight_fetch
+
+    monkeypatch.setattr(decision, "available", lambda root: (False, "缺少 *.onnx"))
+    mine = tmp_path / "my-weights" / "multilingual"
+
+    plan = preflight_fetch(str(mine))
+    assert plan.allowed
+    assert plan.target == mine.resolve()
+
+
+def test_preflight_rejects_unknown_checkpoint():
+    from voice_ctl.decision import preflight_fetch
+
+    plan = preflight_fetch("models/laya-onnx/multilingual", "english")
+    assert not plan.allowed
+    assert "不认识" in plan.reason
+
+
+def test_preflight_never_returns_relative_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """任何输入都不能产出相对路径——那正是 906MB 下到 cwd 的成因。"""
+    from voice_ctl import decision
+    from voice_ctl.decision import preflight_fetch
+
+    monkeypatch.setattr(decision, "available", lambda root: (False, "缺少 *.onnx"))
+    monkeypatch.setattr(bootstrap, "data_dir", lambda: tmp_path / "data")
+
+    for raw in ("models/laya-onnx/multilingual", "models/laya-onnx", "models", "multilingual", ""):
+        plan = preflight_fetch(raw)
+        assert plan.target is not None, raw
+        assert plan.target.is_absolute(), f"{raw!r} -> {plan.target} 不是绝对路径"
 
 
 # --------------------------------------------------------------------------- #

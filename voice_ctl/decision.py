@@ -120,12 +120,17 @@ def available(root: str | Path) -> tuple[bool, str]:
         if _running_frozen():
             # 打包 exe 里缺模块不是"用户没装好"，装 pip 包也修不了——得换一个
             # 把语义层打进包里的构建。说清楚，省得用户白折腾 pip。
+            #
+            # 措辞刻意**不点明变体名**（不写"精简版"）：这个函数看不出自己在
+            # 哪个变体里跑，而实测撞到过——完整版报"这个精简版 exe"，
+            # 用户会以为下错了包。真正的原因是"除了 semantic 变体，打包版
+            # 都没带 torch"，说这一层才准确。
             return (
                 False,
-                f"这个精简版 exe 没带语义层（{e}）。"
-                "语义层需要 torch（约 500MB），所以默认不打包；"
-                "要用它得按 VOICE_CTL_BUNDLE_DECISION=1 重新打包，"
-                "或直接跑源码版（python -m voice_ctl）。",
+                f"这个 exe 没带语义层（{e}）。"
+                "打包版里只有 semantic 变体带语义层——它需要 torch（约 500MB），"
+                "所以 lite/full 都刻意不带；要用它得按 VOICE_CTL_BUNDLE_DECISION=1 "
+                "重新打包，或直接跑源码版（python -m voice_ctl）。",
             )
         return False, f'没装 laya 或版本不对（{e}）。装法：pip install "laya[onnx]"'
 
@@ -233,6 +238,113 @@ class SemanticDecider:
         for a in self.actions:
             lines.append(f"  - {a.id:24} {a.describe or '、'.join(a.aliases)}")
         return "\n".join(lines)
+
+
+@dataclass
+class FetchPlan:
+    """「要不要下 906MB、下到哪」的判断结果。
+
+    抽成一份是因为这个判断以前在**两个地方各写了一遍**（CLI 的 fetch-decision
+    和界面「设置」页的按钮），而两边都只判断了一部分：
+      * CLI 判断了"已就绪就短路"，但没判断"这个构建根本加载不了"
+      * 界面两个都没判断，而且落盘还用配置里的原始相对路径
+    结果是同一个动作走两条路、两种行为。实测撞到过：完整版（不带 torch）
+    从界面点下载，老实下完 906MB，用户再开语义层才看到 No module named 'torch'。
+    """
+
+    allowed: bool
+    """能不能下。False 时 reason 说明为什么。"""
+
+    reason: str
+    """给人看的说明（allowed=True 时是"已就绪/可以下"，False 时是不该下的理由）。"""
+
+    already_ready: bool
+    """已经有了且能用 —— 调用方该直接短路，不要下。"""
+
+    target: Path | None
+    """落盘目录；allowed=False 时为 None。"""
+
+    bundled: bool = False
+    """权重是打包内嵌的。"""
+
+
+def _looks_like_weights_problem(reason: str) -> bool:
+    """`available()` 的说明是不是"权重文件不在"（而不是"这个构建缺东西"）。
+
+    只在权重缺失时下载才有意义。以「缺少」开头的是 `check_weights` 的措辞，
+    其余都是构建缺依赖/缺模块，下了也用不了。
+    """
+    return reason.startswith("缺少")
+
+
+def preflight_fetch(
+    configured_dir: str | Path,
+    which: str = "multilingual",
+    *,
+    default_root: Path | None = None,
+) -> FetchPlan:
+    """下载语义层权重之前的全部判断。CLI 与界面都必须用它。
+
+    三件事一次做完：
+      1. 已经有了（内嵌的，或先前下好的）-> already_ready，不要下
+      2. 这个构建根本加载不了语义层 -> allowed=False，别浪费 906MB
+      3. 落盘位置 -> **绝不**用配置里的相对路径直接喂给 IO
+
+    第 3 条是实测踩出来的：配置里是 `models/laya-onnx/multilingual` 这样的
+    相对路径，相对的是**配置文件所在目录**；而直接拿去 mkdir 会相对于
+    **当前工作目录**。用户从 C:\\Windows\\System32 里跑一次，906MB 就下到那儿了。
+    """
+    if which not in WEIGHTS:
+        return FetchPlan(False, f"不认识 {which!r}；可选：{', '.join(WEIGHTS)}", False, None)
+
+    from . import bootstrap
+
+    want = weights_dir(configured_dir)
+    # 判断"现在能不能用"必须用内嵌兜底：只看配置路径会把打包内嵌那份漏掉，
+    # 于是"明明已经内置了"还提示用户去下 906MB。
+    resolved = bootstrap.resolve_decision_dir(want)
+    ok, why = available(resolved)
+    if ok:
+        ready = weights_dir(resolved)
+        return FetchPlan(True, why, True, ready, bundled=ready != want)
+
+    if not _looks_like_weights_problem(why):
+        # 权重在不在都不重要了——这个 exe 缺的是 torch/laya，下载解决不了
+        return FetchPlan(False, why, False, None)
+
+    target = _resolve_download_target(configured_dir, default_root)
+    return FetchPlan(True, why, False, target)
+
+
+def _resolve_download_target(
+    configured_dir: str | Path, default_root: Path | None
+) -> Path:
+    """确定权重该下到哪。
+
+    不能直接用 configured_dir——那是相对路径（见 preflight_fetch 的说明）。
+    折中做法：保留用户配置的**目录名**，但挂到可写数据目录下，
+    这样它既能被 decision_path() 找到（当配置是相对路径、且数据目录就是
+    配置所在目录时），也不会跑到 cwd 去。
+    """
+    from . import bootstrap
+
+    base = default_root if default_root is not None else bootstrap.data_dir() / "models" / "laya-onnx"
+
+    raw = str(configured_dir).strip()
+    if not raw:
+        return weights_dir(base)
+
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return weights_dir(p)
+
+    # 相对路径：取它的最后一段（通常是 multilingual 或 laya-onnx），挂到 base 下。
+    # 这样 `models/laya-onnx/multilingual` -> `<data>/models/laya-onnx/multilingual`，
+    # 而配置里的同一条相对路径按配置文件所在目录解析，正好也是这里。
+    leaf = p.name or "multilingual"
+    if leaf in ("laya-onnx", "models"):
+        leaf = "multilingual"
+    return weights_dir(base / leaf)
 
 
 def fetch_weights(root: str | Path, which: str = "multilingual") -> list[str]:
