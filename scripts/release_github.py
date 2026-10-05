@@ -112,7 +112,7 @@ VERSIONS = [
     ),
     (
         "v0.3.4",
-        "voice-ctl 0.3.4 —— 语义模型内置，装完就能用",
+        "voice-ctl 0.3.4 —— 语义模型内置（但默认不开）",
         "docs/RELEASE-NOTES-0.3.4.md",
         {
             "lite": ROOT / "dist" / "voice-ctl.exe",
