@@ -8,6 +8,10 @@
 [hotkey]
 # pynput 语法。可改成 <ctrl>+<alt>+j、<f9>、<ctrl>+<shift>+space 等。
 # 注意：纯 <ctrl>+space 在中文 Windows 上是输入法切换键，会被抢，所以默认加了 alt。
+# 用法是**按住说话**：按住不放把话说完，松手才识别。
+# 带修饰键的组合（默认这个）会在你按下 Ctrl/Alt 的那一刻先把麦克风打开
+# （约 150ms），所以从按下到开口之间的字不会被截掉。单键热键（<f9>）没有这个
+# 提前量，但你开口后进来的音频一样会被保留，不会丢字。
 keys = "<ctrl>+<alt>+space"
 min_duration_ms = 200      # 短于此时长视为误触
 max_duration_ms = 15000    # 超时强制停止，防按键卡住
@@ -55,6 +59,11 @@ strip_suffixes = ["谢谢", "吧", "啊", "呀", "呢", "一下", "好么", "好
 # 实测：6 选项零样本下判「有个文件要改一下」「把声音关小」这类口语全对，
 # 单次推理 42-58ms，加载 10.4s（只加载一次）。但它只该兜住第 0 层漏掉的输入，
 # 不该当主判据——官方 benchmark 里 20 选项意图任务是 0.451。
+#
+# ⚠ 这一层**需要 torch（约 500MB）**，哪怕权重是 ONNX 的：laya.onnx_agent 会
+#   顶层 import laya.common，而 laya.common 第 13 行就是 import torch。
+#   所以默认的精简版 exe 开不了它（报 No module named 'torch'，装 pip 包也修不了）
+#   ——要用它请跑源码版，或按 VOICE_CTL_BUNDLE_DECISION=1 重新打包。
 enabled = false
 model = "multilingual"     # 中文务必用 multilingual；english checkpoint 中文接近随机
 min_confidence = 0.6       # 低于此值不执行，只提示。实测负样本正好落在 0.589

@@ -183,6 +183,13 @@ class Recorder:
     """按住开始、松开停止的录音器。
 
     同一时刻只允许一次录音；重复 start() 会抛错而不是悄悄丢掉前一段。
+
+    **开流不能等按下才做。** 冷开流实测 319ms（见 `_open_stream` 的说明），
+    这段 speech 就没了：「明天八点」听成「天八点」。所以有两条路一起走：
+
+      * `arm()` 预热（修饰键按下时调），主键按下时 `start()` 就只剩挪指针；
+      * `start()` 仍然保留预滚缓冲——哪怕没预热，开流这 300ms 里进来的音频
+        也在环形缓冲里，会被当成开头交出去，一个字都不丢。
     """
 
     def __init__(
@@ -219,9 +226,17 @@ class Recorder:
 
         self._recording = False
         self._armed = False
+        self._arming = False
+        """后台预热正在进行中（还没把流开起来）。disarm 靠它把晚到的预热作废。"""
         self._permanent = False
         self._arm_timer: threading.Timer | None = None
+        self._arm_thread: threading.Thread | None = None
+        """异步预热的线程。开流要几百毫秒，钩子线程等不起。"""
+        self._arm_ttl: float | None = ARM_TTL_S
+        """最近一次预热请求的 ttl。开流期间又来的请求会刷新它。"""
         self._start_ts = 0.0
+        self._press_ts = 0.0
+        """按下热键的墙钟时刻（start(at=...) 传进来）。显示与时长的基准。"""
         self._peak = 0.0
         self.level = 0.0
         """最近一小段音频的电平（0-1，带衰减），悬浮提示画电平条用。无锁读写：
@@ -240,7 +255,19 @@ class Recorder:
 
     @property
     def elapsed_ms(self) -> float:
+        """流开好之后过了多久。界面上要显示"这次按住多久"请用 capture_elapsed_ms。"""
         return (time.perf_counter() - self._start_ts) * 1000 if self._recording else 0.0
+
+    @property
+    def capture_elapsed_ms(self) -> float:
+        """这次按住已经过去多久（哪怕流还没开好也照样在走）。
+
+        界面上的"已录 0.8 秒"用它，不用 elapsed_ms：后者要等 start() 真的
+        跑完才有值，冷开流那 300ms 会显示成 0，看起来像没在录。
+        """
+        if not self._recording or not self._press_ts:
+            return 0.0
+        return (time.perf_counter() - self._press_ts) * 1000
 
     @property
     def timed_out(self) -> bool:
@@ -312,15 +339,77 @@ class Recorder:
         if timer is not None:
             timer.cancel()
 
+    def _arm_async(self, ttl: float | None) -> None:
+        """异步预热：立刻返回，开流在后台线程里做。
+
+        为什么必须异步：`on_arm` 是 pynput 的**钩子回调**，Windows 给低级键盘
+        钩子的预算是 LowLevelHooksTimeout（默认 300ms），超了系统会悄悄摘钩子
+        ——症状是「按几次之后热键忽然没反应」，日志上什么都看不到。而开流实测
+        首次 319ms，正好越线。放后台线程后钩子回调只剩几微秒。
+
+        开流期间又来的预热请求不丢弃，只把 ttl 记下来：多键热键每次按下修饰键
+        都会来一次，而 ARM_TTL_S（3 秒）比"按住 Ctrl+Alt 慢慢挪到空格"短——
+        丢掉后来的请求就等于**计时器不续**，用户挪到 3.5 秒时流刚好被关掉，
+        又变回冷开流。
+        """
+        self._arm_ttl = ttl
+        if self._arm_thread is not None and self._arm_thread.is_alive():
+            return
+        self._arming = True
+        thread = threading.Thread(
+            target=self._arm_worker, name="voice-ctl-preheat", daemon=True
+        )
+        self._arm_thread = thread
+        thread.start()
+
+    def _arm_worker(self) -> None:
+        try:
+            self._arm_gated()
+        except Exception:  # noqa: BLE001 - 预热失败只是没预热上，录音时还会再开一次
+            pass
+
+    def _arm_gated(self) -> None:
+        """开完流再确认这次预热还没作废，把定时器按最新的 ttl 续上。
+
+        后台预热天生会晚到：用户可能在开流的 300ms 里已经松手了（disarm 先跑），
+        或者已经按下了主键并录完（stop 把流关了）。没有这个校验的话，后台线程
+        会把刚刚关掉的流又开起来——麦克风图标一直亮着，用户会以为被偷听。
+        """
+        with self._open_lock:
+            if not self._arming:
+                return
+            self._open_stream()
+            if not self._arming:
+                self._close_stream()
+                return
+            self._armed = True
+            self._cancel_arm_timer()
+            ttl = self._arm_ttl
+            if ttl is None:
+                self._permanent = True
+                return
+            if self._permanent:
+                return  # 已经是常开了，别被一次带 ttl 的预热降级
+            timer = threading.Timer(ttl, self._expire_arm)
+            timer.daemon = True
+            self._arm_timer = timer
+            timer.start()
+
     # -- 预热 ------------------------------------------------------------- #
 
-    def arm(self, ttl: float | None = ARM_TTL_S) -> None:
-        """提前把流开好。幂等；要在**非钩子线程**里调（开流要几百毫秒）。
+    def arm(self, ttl: float | None = ARM_TTL_S, *, blocking: bool = True) -> None:
+        """提前把流开好。幂等。
 
         `ttl` 秒内没人 start() 就自动关流；`ttl=None` 表示常开（"低延迟模式"，
         代价是 Windows 一直显示麦克风图标）。
+
+        `blocking=False` 时开流丢给后台线程（钩子线程必须用这个）。
         """
+        if not blocking:
+            self._arm_async(ttl)
+            return
         with self._open_lock:
+            self._arming = True
             self._open_stream()
             self._armed = True
             self._cancel_arm_timer()
@@ -337,6 +426,7 @@ class Recorder:
     def disarm(self) -> None:
         """取消预热并关流。正在录音时什么都不做（录音由 stop()/abort() 收尾）。"""
         with self._open_lock:
+            self._arming = False
             if self._recording:
                 return
             self._cancel_arm_timer()
@@ -352,6 +442,7 @@ class Recorder:
         """彻底关掉：包括常开模式。引擎停止监听时用。"""
         with self._open_lock:
             self._recording = False
+            self._arming = False
             self._cancel_arm_timer()
             self._armed = False
             self._permanent = False
@@ -363,11 +454,25 @@ class Recorder:
 
     # -- 生命周期 --------------------------------------------------------- #
 
-    def start(self) -> None:
+    def start(self, at: float | None = None) -> None:
+        """开始录音。
+
+        `at` 是**按下热键的墙钟时刻**（time.perf_counter()）。异步路上 start()
+        会比按键晚几十到几百毫秒才跑到，不把基准拨回去的话：
+          * `elapsed_ms`（界面上的"已录 x.x 秒"）会少一截；
+          * 用户按住的时间和报出来的录音时长对不上，排查时会被误导。
+
+        刻意的行为：**不清空预滚缓冲**，把开流这段时间进来的音频当成开头交出去。
+        冷开流要 319ms，用户开口比按键早一点（等得急了）或者开流慢，这段就是
+        用户的第一个字。预滚上限 400ms，最多混进 0.4 秒按键之前的环境音，
+        对识别无影响。
+        """
         if self._recording:
             raise RecorderError("已经在录音了，不能重复开始")
+        press_ts = at if at is not None else time.perf_counter()
         with self._open_lock:
             self._cancel_arm_timer()
+            self._arming = False
             self._open_stream()  # 已预热就是空操作；没预热就在这里同步开
             with self._lock:
                 pre = list(self._ring)
@@ -377,13 +482,17 @@ class Recorder:
                 self._taken_frames = sum(c.size for c in pre)
                 self._peak = max((float(np.max(np.abs(c))) for c in pre if c.size), default=0.0)
                 self._start_ts = time.perf_counter()
+                self._press_ts = press_ts
                 self._recording = True
 
     def stop(self) -> Recording:
         if not self._recording:
             raise RecorderError("没有在录音，不能停止")
 
-        duration = time.perf_counter() - self._start_ts
+        # 时长按**按下热键**那一刻算，不按流开好的那一刻——否则异步开流/冷开流
+        # 的那几百毫秒会被算丢，界面显示的"已录 x 秒"比实际按住的时间短。
+        now = time.perf_counter()
+        duration = now - (self._press_ts or self._start_ts)
         with self._lock:
             self._recording = False
 
@@ -419,6 +528,7 @@ class Recorder:
         with self._lock:
             self._recording = False
         with self._open_lock:
+            self._arming = False  # 顺带作废可能还在路上的后台预热
             if not self._permanent:
                 self._armed = False
                 self._close_stream()

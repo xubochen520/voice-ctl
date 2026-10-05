@@ -19,6 +19,6 @@
 
 from .config import AppConfig, ConfigError, load_config
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 __all__ = ["AppConfig", "ConfigError", "load_config", "__version__"]

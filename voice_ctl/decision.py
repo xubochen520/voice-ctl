@@ -23,11 +23,19 @@
   3. **中文务必用 multilingual**。`tozp/laya-onnx` 那个包虽然小（405MB），
      但它是 **english** checkpoint（encoder 是 ModernBERT-large，max_len 512），
      中文用它接近随机，而且**置信度不会报警**。
+  4. **"ONNX 路径不加载 torch" 是错的**（0.3.2 更正）。`laya.onnx_agent` 顶层
+     import `laya.common`，而 `laya.common` 第 13 行就是 `import torch`
+     ——它还要用 `torch.nn`、`torch.device("meta")`、`torch.softmax` 等等
+     （单文件里 40 多处）。所以语义层**永远需要 torch（约 500MB）**，
+     不管权重是不是 ONNX。打包时这直接决定了 exe 尺寸：不带 torch 的 exe
+     一开语义层就报 `No module named 'torch'`，这不是"用户没装好"，
+     是包本身少了一半。
 """
 
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
@@ -95,6 +103,10 @@ def check_weights(root: str | Path) -> tuple[bool, str]:
     return True, f"就绪：{graph.name} ({graph.stat().st_size / 1024 / 1024:.0f}MB)"
 
 
+def _running_frozen() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
 def available(root: str | Path) -> tuple[bool, str]:
     """语义层整体是否可用。"""
     try:
@@ -105,12 +117,22 @@ def available(root: str | Path) -> tuple[bool, str]:
     try:
         from laya.onnx_agent import ONNXAgent  # noqa: F401
     except ImportError as e:
+        if _running_frozen():
+            # 打包 exe 里缺模块不是"用户没装好"，装 pip 包也修不了——得换一个
+            # 把语义层打进包里的构建。说清楚，省得用户白折腾 pip。
+            return (
+                False,
+                f"这个精简版 exe 没带语义层（{e}）。"
+                "语义层需要 torch（约 500MB），所以默认不打包；"
+                "要用它得按 VOICE_CTL_BUNDLE_DECISION=1 重新打包，"
+                "或直接跑源码版（python -m voice_ctl）。",
+            )
         return False, f'没装 laya 或版本不对（{e}）。装法：pip install "laya[onnx]"'
 
     ok, why = check_weights(root)
     if not ok:
         return False, f"{why}；可跑 `voice-ctl fetch-decision` 自动下载"
-    return True, f"可用（ONNX 路径，不加载 torch）—— {why}"
+    return True, f"可用—— {why}"
 
 
 class SemanticDecider:

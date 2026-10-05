@@ -31,15 +31,24 @@
 
 必须排除的：torch / transformers（约 600MB），默认路径用不到；
 只有开启 Laya 语义层才需要，那是可选项，不该让所有人买单。
+
+**但"只是可选"这个说法要更正**（0.3.2 实测）：`VOICE_CTL_BUNDLE_DECISION=1`
+可以把它打进去，而且**语义层其实离不开 torch**——`laya.onnx_agent` 顶层
+import `laya.common`，而 `laya.common` 第 13 行就是 `import torch`，单文件里
+40 多处直接用 `torch.nn` / `torch.softmax`。所以"用 ONNX 权重就不需要 torch"
+是错的：不带 torch 的 exe 一开语义层就是 `No module named 'torch'`。
+两者差 600MB，所以默认仍是排除，但要打就得打全套。
 """
 
 import os
+import sys as _sys
 
 from PyInstaller.utils.hooks import collect_dynamic_libs, collect_data_files
 
 BUNDLE_MODEL = os.environ.get("VOICE_CTL_BUNDLE_MODEL", "0") == "1"
 BUNDLE_LLAMA = os.environ.get("VOICE_CTL_BUNDLE_LLAMA", "0") == "1"
 BUNDLE_LLM_MODEL = os.environ.get("VOICE_CTL_BUNDLE_LLM_MODEL", "0") == "1"
+BUNDLE_DECISION = os.environ.get("VOICE_CTL_BUNDLE_DECISION", "0") == "1"
 ROOT = os.path.abspath(os.getcwd())
 
 datas = [
@@ -108,6 +117,20 @@ try:
 except Exception as e:  # noqa: BLE001
     print(f"[spec] 提示：onnxruntime 未安装或不完整（语义层将不可用）：{e}")
 
+# 4. 语义层（可选，VOICE_CTL_BUNDLE_DECISION=1）的原生部分
+#
+# torch 的 DLL 全在 torch/lib/ 下（实测 9 个共 314MB：c10.dll、torch_cpu.dll、
+# libiomp5md.dll …），PyInstaller 自带的 hook 会把它们放到 torch/lib/，所以
+# 这里不用手动搬；但**必须显式收集**，否则缺 c10.dll 时是启动即崩、报错还
+# 不指向真因。transformers 则是纯 Python + 一堆 json，靠 hook 即可。
+# （hiddenimports 那一长串在下面，因为列表还没定义，这里 append 不了。）
+if BUNDLE_DECISION:
+    for _pkg in ("torch", "onnxruntime"):
+        try:
+            binaries += collect_dynamic_libs(_pkg)
+        except Exception as _e:  # noqa: BLE001
+            print(f"[spec] 警告：收集 {_pkg} 动态库失败：{_e}")
+
 hiddenimports = [
     "voice_ctl",
     "voice_ctl.actions",
@@ -154,13 +177,54 @@ for mod in ("pypinyin", "onnxruntime", "laya.onnx_agent"):
     except Exception:  # noqa: BLE001
         pass
 
+# 语义层打开时，把 laya / transformers / torch 的模块与数据全带上。
+# 列这么细是因为它们大量使用 try/except 和延迟 import，静态分析抓不全；
+# 漏一个的表现是"运行时才炸"，而且用户看不出是打包的问题。
+if BUNDLE_DECISION:
+    hiddenimports += [
+        "laya",
+        "laya.onnx_agent",
+        "laya.common",
+        "laya.confidence",
+        "laya.hooks",
+        "laya.revisions",
+        "laya.structured",
+        "laya.router",
+        "laya.lang",
+        "laya.presets",
+        "laya.email",
+        "transformers",
+        "transformers.models.auto",
+        "transformers.models.auto.tokenization_auto",
+        "transformers.models.modernbert",
+        "tokenizers",
+        "safetensors",
+        "huggingface_hub",
+        "torch",
+        "torch.nn",
+        "torch.nn.functional",
+        "torch.utils.checkpoint",
+    ]
+    try:
+        datas += collect_data_files("transformers", include_py_files=False)
+    except Exception as _e:  # noqa: BLE001
+        print(f"[spec] 警告：收集 transformers 数据文件失败：{_e}")
+    print("[spec] 语义层（Laya + torch）打进 exe：预计 +600MB，启动也会变慢")
+
 excludes = [
-    # 默认路径完全用不到，却占约 600MB
-    "torch", "torchvision", "torchaudio", "transformers",
+    # 默认路径完全用不到，却占约 600MB。要语义层就别排除（见 BUNDLE_DECISION）。
+    *([] if BUNDLE_DECISION else ["torch", "torchvision", "torchaudio", "transformers"]),
     "tensorflow", "jax", "jaxlib", "flax",
-    # 语义层的可选依赖，用户自己装
-    "laya.mcp", "laya.serve", "laya.integrations", "laya.train",
-    "laya.evals", "laya.calibrate", "laya.shortlist",
+    # 语义层的可选依赖，用户自己装。
+    # ⚠ `laya.calibrate` 不在这张名单里（0.3.2 修正）：`laya/onnx_agent.py`
+    #   第 220 行和 652 行都在函数体里 `from .calibrate import ...`，静态分析
+    #   看不到，排除掉的表现是 exe 启动 23 秒之后报
+    #   "加载 ONNX 失败：ModuleNotFoundError: No module named 'laya.calibrate'"
+    #   ——报错指向权重，真因在打包配置里。要开语义层就别排除 laya 的任何子模块。
+    *([] if BUNDLE_DECISION else [
+        "laya.mcp", "laya.serve", "laya.integrations", "laya.train",
+        "laya.evals", "laya.calibrate", "laya.shortlist",
+    ]),
     # 科学计算与绘图的大件
     "matplotlib", "scipy", "pandas", "IPython", "notebook",
     # 图形界面用的是标准库自带的 tkinter（见下），这些第三方 GUI 一律不要。
@@ -187,23 +251,57 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
-    name="voice-ctl",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=False,          # UPX 对 onnxruntime 这类大 DLL 常出问题，且拖慢启动
-    runtime_tmpdir=None,
-    console=True,       # 必须保留控制台：这是个 CLI 工具，用户要看识别结果
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-    # 不改图标：没有 .ico 资源，用默认的比塞一个难看的强
-)
+# 语义层那 600MB 每次启动都要解到临时目录，单文件根本不适合装它：实测
+# `--version` 从 4.3s 变成 20.8s。所以这个变体默认出**目录版**（onedir）——
+# 文件就在 exe 旁边，启动时不用解包。要单文件还是可以显式 ONE_FILE=1。
+ONE_FILE = os.environ.get("VOICE_CTL_ONE_FILE", "1") == "1"
+if BUNDLE_DECISION and os.environ.get("VOICE_CTL_ONE_FILE") is None:
+    ONE_FILE = False
+
+if ONE_FILE:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.datas,
+        [],
+        name="voice-ctl",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,          # UPX 对 onnxruntime 这类大 DLL 常出问题，且拖慢启动
+        runtime_tmpdir=None,
+        console=True,       # 必须保留控制台：这是个 CLI 工具，用户要看识别结果
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+        # 不改图标：没有 .ico 资源，用默认的比塞一个难看的强
+    )
+else:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        name="voice-ctl",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=False,
+        console=True,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+    )
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        name="voice-ctl",
+    )

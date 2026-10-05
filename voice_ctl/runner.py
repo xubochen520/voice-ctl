@@ -500,10 +500,30 @@ class Engine:
                 play_beep(cfg.feedback.beep_end_hz, cfg.feedback.beep_ms)
             self.ev.debug("松开，正在识别", kind="session")
 
+        def on_arm() -> None:
+            """修饰键按下就先把流开好。
+
+            多键热键（Ctrl+Alt+空格）总是先按修饰键、最后才按主键，手指从 Alt
+            挪到空格要 100–300ms。把开流挪到这段时间里，主键按下时麦克风已经在
+            采了——否则实测要 319ms 才开得了流，开口早一点的人开头那个字就没了
+            （「明天八点」听成「天八点」）。
+
+            `blocking=False` 是硬要求：这个回调跑在键盘钩子线程里，而钩子有
+            300ms 预算，超了 Windows 会悄悄摘钩子。
+            """
+            self._recorder.arm(blocking=False)  # type: ignore[union-attr]
+
+        def on_disarm() -> None:
+            # 修饰键松了却没按主键（比如 Ctrl+Alt 用在了别的组合里）：赶紧关流，
+            # 不然 Windows 的麦克风图标一直亮着，用户会以为被偷听了。
+            self._recorder.disarm()  # type: ignore[union-attr]
+
         def on_ready(rec) -> None:  # noqa: ANN001
             # 关键：这里只入队。识别跑在键盘钩子线程里会让 Windows 摘钩子
             self.ev.debug(
-                f"录音 {rec.duration_s * 1000:.0f}ms 峰值 {rec.peak:.3f}，排队识别",
+                f"录音 {rec.duration_s * 1000:.0f}ms 峰值 {rec.peak:.3f}"
+                + (f" 预滚 {rec.preroll_s * 1000:.0f}ms" if rec.preroll_s else "")
+                + "，排队识别",
                 kind="session",
             )
             self._jobs.put(_Job("audio", rec.samples, self.dry_run))
@@ -523,6 +543,8 @@ class Engine:
             min_peak=cfg.audio.min_peak,
             recorder_error=RecorderError,
             stats=self.session_stats,
+            # 开流不能压在钩子线程上（见 SessionController 的说明）
+            capture_async=True,
         )
         controller.timer = HotkeyTimer(cfg.hotkey.max_duration_ms, controller.timeout)
 
@@ -530,10 +552,18 @@ class Engine:
             controller.press()
 
         def on_release() -> None:
+            # 同步收尾（不丢给工作线程）：收尾的第一步就是停采，晚一点收就会多录
+            # 一截——上一句还在识别时尤其明显。这几十毫秒在钩子预算内。
             controller.release()
 
         try:
-            listener = HotkeyListener(self.hotkey_spec, on_press=on_press, on_release=on_release)
+            listener = HotkeyListener(
+                self.hotkey_spec,
+                on_press=on_press,
+                on_release=on_release,
+                on_arm=on_arm,
+                on_disarm=on_disarm,
+            )
             listener.start()
         except HotkeyError as e:
             self._fail(str(e))
@@ -565,6 +595,14 @@ class Engine:
                 pass
         if controller is not None:
             controller.abort()
+        # 关掉录音器，不只是 abort 会话：预热（修饰键已经按下、主键还没按）
+        # 状态下流是开着的，不关的话停止监听之后 Windows 的麦克风图标还亮着。
+        recorder, self._recorder = self._recorder, None
+        if recorder is not None:
+            try:
+                recorder.close()
+            except Exception:  # noqa: BLE001
+                pass
         if self._state == RUNNING:
             self._set_state(IDLE)
             self.ev.info("已停止监听", kind="engine")
@@ -581,6 +619,21 @@ class Engine:
         if c is None:
             return False
         return bool(c.timer.tick())  # type: ignore[attr-defined]
+
+    def capture_state(self) -> tuple[bool, float, float]:
+        """(是否在录, 这次按住多久 ms, 当前电平 0-1)。界面画"正在录音"用它。
+
+        电平读的是录音器的衰减峰值：一个 float 的读取，无锁——读到旧值最多让
+        电平条晚一帧，不值得为它加锁。
+        """
+        rec = self._recorder
+        if rec is None:
+            return (False, 0.0, 0.0)
+        return (
+            bool(getattr(rec, "recording", False)),
+            float(getattr(rec, "capture_elapsed_ms", 0.0)),
+            float(getattr(rec, "level", 0.0)),
+        )
 
     def close(self) -> None:
         self.stop()

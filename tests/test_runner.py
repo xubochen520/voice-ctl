@@ -342,3 +342,111 @@ def test_state_label_is_chinese(engine: Engine):
     assert engine.running is False
     assert engine.state == IDLE
     assert RUNNING == "running"
+
+
+# --------------------------------------------------------------------------- #
+# 录音链路（0.3.2：按住说话不能吃掉开头）
+# --------------------------------------------------------------------------- #
+
+
+class FakeRecorder:
+    """只记录被调用过什么，用来验证 Engine 有没有正确接管录音器的生命周期。"""
+
+    def __init__(self) -> None:
+        self.arming = 0
+        self.disarming = 0
+        self.closes = 0
+        self.recording = False
+        self.capture_elapsed_ms = 0.0
+        self.level = 0.0
+
+    def arm(self, ttl=None, *, blocking: bool = True) -> None:  # noqa: ANN001
+        self.arming += 1
+        assert blocking is False, "预热跑在键盘钩子线程里，必须异步——否则逼近 300ms 红线"
+
+    def disarm(self) -> None:
+        self.disarming += 1
+
+    def close(self) -> None:
+        self.closes += 1
+
+    def start(self, at=None) -> None:  # noqa: ANN001
+        self.recording = True
+
+    def stop(self):  # noqa: ANN201
+        raise AssertionError("这个替身不参与真实录音路径")
+
+    def abort(self) -> None:
+        pass
+
+
+def test_stop_closes_the_recorder(engine: Engine):
+    """停止监听要把录音器关掉，不能只 abort 会话。
+
+    预热状态下（修饰键按着、主键还没按）流是开着的。不关的话停止监听之后
+    Windows 的麦克风图标还亮着，用户会以为被偷听了。
+    """
+    fake = FakeRecorder()
+    engine.prepare()
+    engine.start()
+    engine._recorder = fake  # noqa: SLF001 - 就是要替掉真设备
+    engine.stop()
+    assert fake.closes == 1
+    assert engine._recorder is None  # noqa: SLF001
+
+
+def test_capture_state_is_safe_before_start(engine: Engine):
+    """界面每 120ms 轮询一次，没启动监听时也必须能安全拿到值。"""
+    assert engine.capture_state() == (False, 0.0, 0.0)
+
+
+def test_capture_state_reports_the_recorder(engine: Engine):
+    fake = FakeRecorder()
+    fake.recording = True
+    fake.capture_elapsed_ms = 1234.0
+    fake.level = 0.5
+    engine._recorder = fake  # noqa: SLF001
+    assert engine.capture_state() == (True, 1234.0, 0.5)
+
+
+def test_hotkey_arm_callback_is_wired_to_the_recorder(engine: Engine, monkeypatch, cfg):  # noqa: ANN001
+    """修饰键按下必须真的去预热录音器。
+
+    这就是 0.3.2 修的那个缺陷：`HotkeyListener` 早就提供了 `on_arm` /
+    `on_disarm`，`Recorder` 也早就实现了 `arm()` / 预滚缓冲，但 runner 一个都
+    没传——两边都是死代码，从没被调用过。表现是「按下热键说的头一个字被吃掉」，
+    而看日志像是识别不准。
+    """
+    import voice_ctl.hotkey as hk
+    import voice_ctl.runner as R
+
+    fake = FakeRecorder()
+    monkeypatch.setattr(R, "Recorder", lambda **_kw: fake)
+
+    captured: dict[str, object] = {}
+
+    class SpyListener:
+        def __init__(self, spec, **kw) -> None:  # noqa: ANN003
+            captured.update(kw)
+            captured["spec"] = spec
+
+        def start(self) -> None:
+            captured["started"] = True
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(hk, "HotkeyListener", SpyListener)
+    engine.prepare()
+    assert engine.start() is True
+    assert captured.get("started") is True
+
+    arm = captured.get("on_arm")
+    disarm = captured.get("on_disarm")
+    assert callable(arm) and callable(disarm), "runner 必须把预热回调接上"
+    arm()  # type: ignore[operator]
+    disarm()  # type: ignore[operator]
+    assert fake.arming == 1
+    assert fake.disarming == 1
+
+

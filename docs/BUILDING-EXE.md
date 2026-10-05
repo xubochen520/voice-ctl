@@ -33,19 +33,52 @@ Remove-Item Env:\VOICE_CTL_BUNDLE_MODEL
 
 产物：`dist\voice-ctl.exe` / `dist-full\voice-ctl.exe`。
 
-## 三个打包开关
+## 四个打包开关
 
 | 环境变量 | 内容 | 建议 |
 |---|---|---|
 | `VOICE_CTL_BUNDLE_LLAMA` | 39.8MB llama.cpp 运行时 | **打**——它是"内置小模型层"的前提，而从 GitHub 下载要用户能访问 github.com |
 | `VOICE_CTL_BUNDLE_LLM_MODEL` | 469MB~1GB 的 GGUF 模型 | **别打**——单文件 exe 每次启动都要解包它 |
 | `VOICE_CTL_BUNDLE_MODEL` | 226MB 识别模型 | 看情况（`full` 变体就是它） |
+| `VOICE_CTL_BUNDLE_DECISION` | torch + transformers + laya，约 600MB | **默认别打**——只有要开 Laya 语义层才需要 |
 | （依赖）`psutil` | 约 0.1MB | **打**——关闭应用靠它列进程，16ms vs WMI 的 677ms |
+
+### 为什么语义层要单独一个开关（0.3.2 更正）
+
+以前这里写着"用 ONNX 权重就不需要 torch，所以默认排除"。**这句是错的**：
+
+```
+File "laya\onnx_agent.py", line 15, in <module>
+    from laya.common import (...)
+File "laya\common.py", line 13, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+```
+
+`laya.onnx_agent` 顶层 import `laya.common`，而 `laya.common` 第一行就
+`import torch`（单文件里 40 多处直接用 `torch.nn` / `torch.softmax` /
+`torch.device("meta")`）。**torch 是硬依赖，跟权重是不是 ONNX 无关。**
+实测 `torch/` 502MB + `transformers/` 100MB。
+
+后果：默认构建出的 exe 一开 `[decision].enabled = true` 就报
+`No module named 'torch'`，而且提示是"去 pip install laya[onnx]"——用户装了也
+没用，因为缺的是 exe 里那一半。0.3.2 改了提示语，指明是"这个 exe 没带语义层"。
+
+```powershell
+# 全量版：连语义层一起打进去（约 800MB+）
+$env:VOICE_CTL_BUNDLE_MODEL='1'; $env:VOICE_CTL_BUNDLE_LLAMA='1'
+$env:VOICE_CTL_BUNDLE_DECISION='1'
+.venv\Scripts\python -m PyInstaller voice-ctl.spec --noconfirm --distpath dist-decision --workpath build-decision
+```
+
+torch 的 DLL 全在 `torch/lib/` 下（9 个共 314MB），`collect_dynamic_libs("torch")`
+会把它们放到 `torch/lib/`——**必须显式收集**，缺 `c10.dll` 时是启动即崩，
+而报错完全不指向真因。
 
 **为什么 GGUF 不该打进 exe**：PyInstaller 的单文件 exe 每次启动都把内嵌数据
 解包到临时目录。0.2.0 实测过这条路的代价——226MB 的识别模型让启动从 1.7s
 变成 3.1s。469MB 只会更糟，而且是**每次启动**都白写 469MB 到磁盘。
-让用户下一次，比每次启动都解包划算。
+让用户下一次，比每次启动都解包划算。同一条理由也适用于语义层那 600MB。
 
 **为什么运行时可以打**：内嵌的是 22 个 DLL，只有真的开出小模型层才会被加载。
 不开的话它们只是磁盘上的几行目录项。

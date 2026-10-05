@@ -259,6 +259,119 @@ def test_level_tracks_peak_and_decays(fake_sd):  # noqa: ANN001
 
 
 # --------------------------------------------------------------------------- #
+# 异步预热（钩子线程专用路径）
+# --------------------------------------------------------------------------- #
+
+
+def _wait(pred, timeout: float = 2.0) -> bool:  # noqa: ANN001
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        if pred():
+            return True
+        time.sleep(0.005)
+    return pred()
+
+
+def test_arm_async_returns_immediately_and_opens_in_background(fake_sd):  # noqa: ANN001
+    """钩子线程调 arm(blocking=False) 必须立刻返回。
+
+    这是硬要求：Windows 给低级键盘钩子 300ms 预算，超了系统会悄悄摘掉钩子，
+    表现是「按几次之后热键忽然没反应」而且日志上什么都看不到。而开流实测
+    首次 319ms，正好越线。
+    """
+    rec = Recorder()
+    t = time.perf_counter()
+    rec.arm(blocking=False)
+    call_ms = (time.perf_counter() - t) * 1000
+    assert call_ms < 20, f"钩子线程里 arm 花了 {call_ms:.1f}ms，必须几乎为零"
+    assert _wait(lambda: rec.armed), "后台线程应当把流开起来"
+
+
+def test_arm_async_is_idempotent(fake_sd):  # noqa: ANN001
+    rec = Recorder()
+    for _ in range(5):
+        rec.arm(blocking=False)
+    assert _wait(lambda: rec.armed)
+    time.sleep(0.1)
+    assert len(FakeStream.instances) == 1, "重复预热只该开一个流"
+
+
+def test_arm_async_refreshes_ttl_while_opening(fake_sd):  # noqa: ANN001
+    """开流期间又来的预热请求要把定时器续上，不能把流忘了关、也不能提前关。
+
+    ARM_TTL_S 是 3 秒，比"按住 Ctrl+Alt 慢慢挪到空格"短。丢掉后来的请求就等于
+    计时器不续：挪到 3.5 秒时流刚好被关掉，于是又变回冷开流——而这一整套存在
+    的意义就是别冷开流。
+    """
+    rec = Recorder()
+    rec.arm(ttl=0.2, blocking=False)
+    time.sleep(0.05)
+    rec.arm(ttl=0.2, blocking=False)  # 模拟用户还在按修饰键，又按了一次
+    assert _wait(lambda: rec.armed)
+    time.sleep(0.1)
+    assert rec.armed, "刚续上的 ttl 不该立刻到期"
+    assert _wait(lambda: not rec.armed), "续期之后仍然要能自动关掉"
+    assert live().closed
+
+
+def test_disarm_before_async_arm_finishes_does_not_reopen_mic(fake_sd):  # noqa: ANN001
+    """松手比开流快时，晚到的后台预热不能把刚关掉的流又开起来。
+
+    不然 Windows 的麦克风图标会一直亮着，用户会以为被偷听了。
+    """
+    rec = Recorder()
+    rec.arm(blocking=False)
+    rec.disarm()  # 修饰键已经松了
+    time.sleep(0.2)
+    assert not rec.armed, "后台预热应当被作废"
+    for s in FakeStream.instances:
+        assert s.closed, "开起来的流必须被关掉"
+
+
+def test_start_backdates_duration_to_the_keypress(fake_sd):  # noqa: ANN001
+    """异步路上 start() 比按键晚几十~几百毫秒，时长要按**按下**那一刻算。
+
+    不拨回去的话界面上"已录 x 秒"比实际按住的时间短，排查时会被误导。
+    """
+    rec = Recorder()
+    press_ts = time.perf_counter() - 0.30  # 假装 300ms 前就按下了（冷开流的代价）
+    rec.start(at=press_ts)
+    time.sleep(0.10)
+    out = rec.stop()
+    assert out.duration_s == pytest.approx(0.40, abs=0.08), f"实际 {out.duration_s:.3f}s"
+
+
+def test_capture_elapsed_runs_from_the_keypress(fake_sd):  # noqa: ANN001
+    """"已录 x 秒"要在流还没开好时就开始走，否则那 300ms 显示成 0，像没在录。"""
+    rec = Recorder()
+    assert rec.capture_elapsed_ms == 0.0
+    rec.start(at=time.perf_counter() - 0.2)
+    assert 180 <= rec.capture_elapsed_ms <= 400, f"实际 {rec.capture_elapsed_ms:.0f}ms"
+    rec.stop()
+    assert rec.capture_elapsed_ms == 0.0, "录音结束后要归零"
+
+
+def test_cold_start_keeps_the_audio_that_arrived_while_opening(fake_sd, monkeypatch):  # noqa: ANN001
+    """没预热时，开流那 300ms 里进来的音频不能丢——它就是用户的第一个字。
+
+    用 FakeStream.feed 模拟"开流期间回调已经在送音频"。
+    """
+    original = FakeStream.start
+
+    def slow_start(self) -> None:  # noqa: ANN001
+        original(self)
+        self.feed(0.7)  # 流一开就有音频进来，而这时 start() 还没返回
+        self.feed(0.7)
+
+    monkeypatch.setattr(FakeStream, "start", slow_start)
+    rec = Recorder(preroll_ms=400)
+    rec.start(at=time.perf_counter())
+    out = rec.stop()
+    assert out.samples.size >= 2 * CHUNK, "开流期间的音频必须被当成开头交出去"
+    assert out.peak == pytest.approx(0.7)
+
+
+# --------------------------------------------------------------------------- #
 # 设备列表
 # --------------------------------------------------------------------------- #
 

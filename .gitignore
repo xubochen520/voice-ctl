@@ -15,11 +15,16 @@ llm/
 # 打包产物（构建脚本重新生成，不进版本库）
 build/
 build-full/
+build-decision/
 dist/
 dist-full/
+dist-decision/
 dist-new/
 dist-full-new/
 *.pdb
+
+# 临时探针脚本（诊断完就删，别混进版本库）
+scripts/_tmp_*.py
 
 # 生成物：测试音频、基准明细
 assets/tts/

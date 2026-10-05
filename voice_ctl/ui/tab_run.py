@@ -21,6 +21,8 @@ class RunTab(tk.Frame):
         self._action_pill: W.StatusPill
         self._report: tk.Text
         self._model_present: bool | None = None
+        self._ring_text = ""
+        self._ring_lit = -1
         self._build()
 
     # -- 构建 ------------------------------------------------------------- #
@@ -53,6 +55,24 @@ class RunTab(tk.Frame):
         self._hot_box.pack(side="left")
         self._render_hotkey()
 
+        # 录音指示：按下到松开之间只有 120ms 一次的轮询能看到它，但它解决的是
+        # 「我按了到底有没有在录」——没有它，用户只能靠猜，或者反复点启动/停止。
+        self._ring = tk.Frame(body, bg=P["surface"])
+        self._ring.pack(fill="x", pady=(S(10), 0))
+        self._ring_lbl = tk.Label(
+            self._ring, text="", bg=P["surface"], fg=P["faint"],
+            font=W.theme.FONTS["body"], anchor="w",
+        )
+        self._ring_lbl.pack(side="left")
+        self._ring_segs: list[tk.Frame] = []
+        segs = tk.Frame(self._ring, bg=P["surface"])
+        segs.pack(side="left", padx=(S(10), 0))
+        for _ in range(16):
+            seg = tk.Frame(segs, bg=P["surface2"], width=S(6), height=S(12))
+            seg.pack(side="left", padx=1)
+            seg.pack_propagate(False)
+            self._ring_segs.append(seg)
+
         btns = tk.Frame(body, bg=P["surface"])
         btns.pack(fill="x", pady=(S(14), 0))
         self._toggle = ttk.Button(btns, text="启动监听", style="Primary.TButton",
@@ -63,6 +83,12 @@ class RunTab(tk.Frame):
         ttk.Button(btns, text="重新加载配置", command=self.app.reload_config).pack(side="left")
         ttk.Button(btns, text="体检", style="Ghost.TButton",
                    command=lambda: self.app.show_tab("about")).pack(side="right")
+
+        W.hint(
+            body,
+            f"用法是「按住说话」：按住 {self.app.engine.hotkey_spec} 不放、把话说完，"
+            "松手才识别执行。中途松手就等于说完了——录到的时长以松手那一刻为准。",
+        ).pack(fill="x", pady=(S(12), 0))
 
         # --- 试一句 -------------------------------------------------------
         card2 = W.Card(wrap, title="试一句")
@@ -149,8 +175,30 @@ class RunTab(tk.Frame):
                 self._model_present = False
         return self._model_present
 
+    def _refresh_ring(self) -> None:
+        """按下热键期间的实时指示：已录多久 + 电平条。
+
+        以前这段时间界面上什么都没变，用户不知道到底在不在录，只能反复点
+        「启动监听」——日志里那串「已启动/已停止」就是这么来的。
+        """
+        live, ms, level = self.app.engine.capture_state()
+        if not live:
+            text, color, lit = "未录音 · 按住热键说话", P["faint"], 0
+        else:
+            # 电平条不用等流开好：开流那 300ms 里按住的时长照样在走
+            text, color = f"● 正在录音 {ms / 1000:.1f}s", P["error"]
+            lit = min(len(self._ring_segs), int(level * len(self._ring_segs) * 1.6))
+        if text != self._ring_text:
+            self._ring_text = text
+            self._ring_lbl.configure(text=text, fg=color)
+        if lit != self._ring_lit:
+            self._ring_lit = lit
+            for i, seg in enumerate(self._ring_segs):
+                seg.configure(bg=P["error"] if i < lit else P["surface2"])
+
     def _refresh(self, *, force: bool = False) -> None:
         eng = self.app.engine
+        self._refresh_ring()
         label = eng.state_label
         if eng.state == "running":
             label = f"运行中 · 按住 {eng.hotkey_spec} 说话"

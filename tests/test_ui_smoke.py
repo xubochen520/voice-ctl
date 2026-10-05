@@ -182,6 +182,31 @@ def test_run_tab_dry_run_toggle(app):  # noqa: ANN001
     assert app.engine.dry_run is False
 
 
+def test_run_tab_shows_recording_feedback(app):  # noqa: ANN001
+    """按住热键那几秒界面必须有反应。
+
+    没有它用户不知道到底在不在录，只能反复点「启动监听」——日志里那串
+    「已启动/已停止」就是这么来的。
+    """
+    from voice_ctl.ui.theme import PALETTE as P
+
+    app.show_tab("run")
+    run = app.tabs["run"]
+    assert "未录音" in run._ring_lbl.cget("text")
+
+    app.engine.capture_state = lambda: (True, 1200.0, 0.5)  # type: ignore[method-assign]
+    run.on_tick()
+    text = run._ring_lbl.cget("text")
+    assert "正在录音" in text and "1.2s" in text, text
+    lit = [s for s in run._ring_segs if s.cget("bg") == P["error"]]
+    assert 0 < len(lit) < len(run._ring_segs), "电平条要亮一部分（不该全亮或全灭）"
+
+    app.engine.capture_state = lambda: (False, 0.0, 0.0)  # type: ignore[method-assign]
+    run.on_tick()
+    assert "未录音" in run._ring_lbl.cget("text")
+    assert not [s for s in run._ring_segs if s.cget("bg") == P["error"]], "松开后电平条要全灭"
+
+
 def test_model_pill_distinguishes_missing_from_not_loaded(app, cfg_path: Path):  # noqa: ANN001
     """「没加载」和「没有」必须分得清。
 
