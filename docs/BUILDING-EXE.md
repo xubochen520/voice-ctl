@@ -6,7 +6,7 @@
 |---|---|---|---|---|
 | **lite** | 84.1 MB | 需跑一次 `download`（226MB） | **2.4s** | 日常使用（模型放 exe 旁边，启动不解包） |
 | **full** | 236.1 MB | 开箱即用 | 3.8s | 想零配置、或不方便单独下模型 |
-| **semantic** | 约 1.4 GB | **完全离线**，什么都不用下 | 目录版，与 full 同级 | 要用语义层、且要求全程不联网 |
+| **semantic** | 1.8 GB 目录 / 1.4 GB zip | **完全离线**，什么都不用下 | 目录版，与 full 同级 | 要用语义层、且要求全程不联网 |
 
 前两者功能一致，只差识别模型是否内嵌。**常用建议选 lite**：虽然要多下一次，
 但每次启动快一倍——`full` 每次运行都要把 226MB 解包到临时目录。
@@ -38,6 +38,14 @@ $env:VOICE_CTL_BUNDLE_DECISION='1'; $env:VOICE_CTL_BUNDLE_DECISION_WEIGHTS='1'
 ```
 
 产物：`dist\voice-ctl.exe` / `dist-full\voice-ctl.exe` / `dist-semantic\voice-ctl\voice-ctl.exe`。
+
+语义版发布前要打成 zip（GitHub Release 的资产是单个文件，而它是目录版）：
+
+```powershell
+.venv\Scripts\python.exe scripts\zip_semantic.py
+# -> dist-semantic\voice-ctl-semantic.zip（1.4GB；873MB 的 int8 图已量化过，
+#    按不压缩存入，压它只是白烧 CPU）
+```
 
 ## 五个打包开关
 
