@@ -110,8 +110,8 @@ def _selftest() -> int:
         ttk.Treeview(root, columns=["a"]).pack()
         root.update_idletasks()
         say(f"  ✓ 窗口与 ttk 样式就绪（缩放 {theme.SCALE:.2f}×，字体 {theme.FONTS['body'][0]}）")
-        if not theme.apply_dark_titlebar(root):
-            say("  · 深色标题栏没设上（只影响观感）")
+        if not theme.apply_titlebar(root):
+            say("  · 标题栏配色没设上（只影响观感）")
         root.destroy()
     except Exception as e:  # noqa: BLE001
         say(f"  ✗ 图形界面建不起来: {type(e).__name__}: {e}")
