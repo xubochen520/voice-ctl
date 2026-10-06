@@ -1,38 +1,55 @@
-"""「功能」页：看清有哪些能力、改说法、试跑、增删。"""
+"""「功能」页：看清有哪些能力、改说法、试跑、增删。
+
+左边是动作列表（每行：状态灯 + id + 说法 + 就地开关），右边是选中动作的详情表单；
+「保存修改 / 试运行 / 真的执行」固定在右栏底部——表单很长，按钮不该跟着滚走
+（以前它们就是被裁在窗口外面的）。
+"""
 
 from __future__ import annotations
 
 import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
+from collections.abc import Callable
+from tkinter import messagebox
 from typing import Any
 
 from .. import events
 from ..config import ActionConfig
+from . import gfx
 from . import widgets as W
+from .kit import RoundedBg, ellipsize
+from .theme import FONTS
 from .theme import PALETTE as P
-from .theme import S
+from .theme import S, hair, tint
 
 HANDLER_LABEL = {
     "open_app": "启动程序",
+    "open_target": "打开你说的应用",
     "open_path": "打开路径",
     "open_url": "打开网址",
     "sysctl": "系统操作",
     "keys": "发送按键",
     "shell": "执行命令",
+    "close_app": "关闭应用",
+    "schedule": "记日程",
 }
 
 HANDLER_TARGET_HINT = {
     "open_app": "exe 名（notepad.exe）、程序名或留空自动查找",
+    "open_target": "留空 = 按你说的名字从已安装的应用里找；填了就固定打开这个程序",
     "open_path": r"要打开的文件夹或文件，支持环境变量如 %USERPROFILE%",
     "open_url": "https://… 或协议式地址（ms-settings:）",
     "sysctl": "volume_up / volume_down / mute / lock / screenshot / show_desktop / sleep / explorer",
     "keys": "键序列，如 ctrl+alt+w",
     "shell": "要执行的命令行（默认关闭，有风险）",
+    "close_app": "留空 = 按你说的名字解析要关谁；或写进程名（如 notepad.exe）",
+    "schedule": "不用填——时间和标题取自你说的那句话",
 }
 
 DANGEROUS_SYSCTL = {"lock", "sleep"}
-STATUS_GLYPH = {"ok": "✓", "bad": "✗", "soft": "·", "?": "?"}
+
+# 预检结果 → 提示条的类型
+_STATUS_KIND = {"ok": "ok", "bad": "error", "soft": "info", "?": "info"}
 
 
 def split_list(text: str) -> list[str]:
@@ -46,15 +63,185 @@ def split_list(text: str) -> list[str]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# 左栏：动作列表
+# --------------------------------------------------------------------------- #
+
+
+class _Row(tk.Canvas):
+    """列表里的一行。整行一块 Canvas 自己画：状态灯、两行字、右边一个小开关。
+
+    一行用一个控件而不是 6 个：二三十个动作 × 6 个小控件，每次搜索/刷新都要整批重建。
+    """
+
+    def __init__(self, master: tk.Misc, item: dict[str, Any], *, selected: bool,
+                 on_click: Callable[[int], None], on_toggle: Callable[[int], None]) -> None:
+        self._bg = W.bg_of(master)
+        super().__init__(master, height=S(56), bg=self._bg, highlightthickness=0, bd=0, cursor="hand2")
+        self.item = item
+        self._selected = selected
+        self._hover = False
+        self._on_click, self._on_toggle = on_click, on_toggle
+        self._wd = 0
+        self._tile = RoundedBg(self, S(10), None, None, 0)
+        self._dot = self.create_image(S(16), S(28), anchor="center")
+        self._title = self.create_text(S(32), S(20), anchor="w", font=FONTS["body"])
+        self._sub = self.create_text(S(32), S(39), anchor="w", font=FONTS["note"])
+        self._track = self.create_image(0, S(28), anchor="e")
+        self._knob = self.create_image(0, S(28), anchor="center")
+        self.bind("<Configure>", self._on_configure)
+        self.bind("<Enter>", lambda _e: self._set_hover(True))
+        self.bind("<Leave>", lambda _e: self._set_hover(False))
+        self.bind("<ButtonPress-1>", self._press)
+
+    def set_selected(self, on: bool) -> None:
+        if on != self._selected:
+            self._selected = on
+            self._paint()
+
+    def _set_hover(self, on: bool) -> None:
+        self._hover = on
+        self._paint()
+
+    def _on_configure(self, e: tk.Event) -> None:
+        self._wd = e.width
+        self._tile.resize(e.width, e.height)
+        self._paint()
+
+    def _switch_left(self) -> int:
+        return self._wd - S(14) - S(30) - S(6)
+
+    def _press(self, e: tk.Event) -> None:
+        idx = self.item["index"]
+        if e.x >= self._switch_left():
+            self._on_toggle(idx)
+        else:
+            self._on_click(idx)
+
+    def _paint(self) -> None:
+        if not self._wd:
+            return
+        it, w = self.item, self._wd
+        on = it["enabled"]
+        if self._selected:
+            self._tile.set(fill=P["raised"], border=P["line_strong"], bw=hair())
+        elif self._hover:
+            self._tile.set(fill=tint(self._bg, 0.05), border=None, bw=0)
+        else:
+            self._tile.set(fill=None, border=None, bw=0)
+        # 状态灯：能跑通绿、有问题红、没装（正常状态）灰；停用的画成空心
+        status = it["status"]
+        color = {"ok": P["ok"], "bad": P["err"], "soft": P["ink4"]}.get(status, P["line_strong"])
+        d = S(9)
+        if on:
+            img = gfx.photo(self, ("adot", d, color), lambda: gfx.dot_rgba(d, 0, color, 0.0))
+        else:
+            img = gfx.photo(self, ("adot-off", d), lambda: gfx.rrect_rgba(d, d, d / 2, None, P["ink4"], hair() + 1))
+        self.itemconfigure(self._dot, image=img)
+        room = self._switch_left() - S(32) - S(8)
+        self.itemconfigure(self._title, text=ellipsize(it["id"], FONTS["body"], room),
+                           fill=P["ink"] if on else P["ink4"])
+        self.itemconfigure(self._sub, text=ellipsize(it["aliases"] or "（没有说法）", FONTS["note"], room),
+                           fill=P["ink3"] if on else P["ink4"])
+        tw, th = S(30), S(16)
+        tfill = P["ink"] if on else "#C3CBCA"
+        self.itemconfigure(self._track, image=gfx.photo(
+            self, ("mini-sw", tw, th, tfill), lambda: gfx.rrect_rgba(tw, th, th / 2, tfill, None, 0)))
+        self.coords(self._track, w - S(14), S(28))
+        kd = th - S(4)
+        self.itemconfigure(self._knob, image=gfx.photo(
+            self, ("mini-knob", kd), lambda: gfx.rrect_rgba(kd, kd, kd / 2, "#FFFFFF", None, 0)))
+        self.coords(self._knob, w - S(14) - tw + (tw - S(2) - kd // 2 if on else S(2) + kd // 2), S(28))
+        for it_ in (self._dot, self._title, self._sub, self._track, self._knob):
+            self.tag_raise(it_)
+
+
+class ActionList(tk.Frame):
+    """动作列表。选中项是一块浮起的白色瓷砖；点右边的小开关直接启用/停用。"""
+
+    def __init__(self, master: tk.Misc, *, on_select: Callable[[int], None],
+                 on_toggle: Callable[[int], None]) -> None:
+        bg = W.bg_of(master)
+        super().__init__(master, bg=bg, takefocus=True)
+        self._on_select, self._on_toggle = on_select, on_toggle
+        self._scroll = W.ScrollFrame(self, bg=bg)
+        self._scroll.pack(fill="both", expand=True)
+        self._rows: dict[int, _Row] = {}
+        self._order: list[int] = []
+        self._shown: list[dict[str, Any]] = []
+        self.selected: int | None = None
+        self.bind("<Up>", lambda _e: self._step(-1))
+        self.bind("<Down>", lambda _e: self._step(1))
+        self.bind("<space>", lambda _e: self._space())
+
+    @property
+    def count(self) -> int:
+        return len(self._order)
+
+    @property
+    def indices(self) -> list[int]:
+        return list(self._order)
+
+    def set_items(self, items: list[dict[str, Any]], selected: int | None) -> None:
+        # 内容没变就别重建：每次切到这一页、每次预检结果回来都会调这里，
+        # 销毁再创建二三十个 Canvas 是肉眼可见的卡顿
+        if items == self._shown and self._rows:
+            if selected in self._rows and selected != self.selected:
+                self.select(selected, notify=False)
+            return
+        self._shown = [dict(it) for it in items]
+        for w in self._scroll.inner.winfo_children():
+            w.destroy()
+        self._rows = {}
+        self._order = [it["index"] for it in items]
+        self.selected = selected if selected in self._order else None
+        for it in items:
+            row = _Row(self._scroll.inner, it, selected=it["index"] == self.selected,
+                       on_click=self._clicked, on_toggle=self._on_toggle)
+            row.pack(fill="x", pady=1)
+            self._rows[it["index"]] = row
+
+    def _clicked(self, index: int) -> None:
+        self.focus_set()
+        self.select(index)
+
+    def select(self, index: int, *, notify: bool = True) -> None:
+        if index not in self._rows:
+            return
+        if self.selected in self._rows:
+            self._rows[self.selected].set_selected(False)
+        self.selected = index
+        self._rows[index].set_selected(True)
+        self._scroll.scroll_into_view(self._rows[index])
+        if notify:
+            self._on_select(index)
+
+    def _step(self, d: int) -> str:
+        if not self._order:
+            return "break"
+        pos = self._order.index(self.selected) if self.selected in self._order else -1
+        self.select(self._order[max(0, min(len(self._order) - 1, pos + d))])
+        return "break"
+
+    def _space(self) -> str:
+        if self.selected is not None:
+            self._on_toggle(self.selected)
+        return "break"
+
+
+# --------------------------------------------------------------------------- #
+# 页面
+# --------------------------------------------------------------------------- #
+
+
 class ActionsTab(tk.Frame):
     def __init__(self, master: tk.Misc, app: Any) -> None:
-        super().__init__(master, bg=P["bg"])
+        super().__init__(master, bg=P["chassis"])
         self.app = app
         self._index: int | None = None
         self._status: dict[str, tuple[str, str]] = {}
         self._pending: list[tuple[str, str, str]] | None = None
         self._building = False
-        self._rows: dict[str, int] = {}
 
         v = tk.StringVar
         self._f_id = v()
@@ -65,127 +252,117 @@ class ActionsTab(tk.Frame):
         self._f_args = v()
         self._f_enabled = tk.BooleanVar(value=True)
         self._search = v()
+        self._inputs: list[Any] = []
         self._build()
 
     # -- 构建 ------------------------------------------------------------- #
 
     def _build(self) -> None:
-        outer = tk.Frame(self, bg=P["bg"])
-        outer.pack(fill="both", expand=True, padx=S(18), pady=S(18))
+        outer = tk.Frame(self, bg=P["chassis"])
+        outer.pack(fill="both", expand=True, padx=S(28), pady=S(26))
 
-        left = tk.Frame(outer, bg=P["bg"], width=S(330))
+        left = tk.Frame(outer, bg=P["chassis"], width=S(320))
         left.pack(side="left", fill="y")
         left.pack_propagate(False)
-        right = tk.Frame(outer, bg=P["bg"])
-        right.pack(side="left", fill="both", expand=True, padx=(S(14), 0))
+        right = tk.Frame(outer, bg=P["chassis"])
+        right.pack(side="left", fill="both", expand=True, padx=(S(20), 0))
 
         # --- 左：列表 -----------------------------------------------------
-        tk.Label(left, text="动作列表", bg=P["bg"], fg=P["muted"], font=W.theme.FONTS["small"],
-                 anchor="w").pack(fill="x")
-        tk.Label(
-            left, text="勾选 = 参与语音匹配；取消勾选后这个动作还在，只是听不到。",
-            bg=P["bg"], fg=P["faint"], font=W.theme.FONTS["tiny"], anchor="w",
-            justify="left", wraplength=S(320),
-        ).pack(fill="x", pady=(S(4), S(8)))
-
-        srow = tk.Frame(left, bg=P["bg"])
-        srow.pack(fill="x", pady=(0, S(8)))
-        ent = ttk.Entry(srow, textvariable=self._search)
-        ent.pack(fill="x")
-        ent.bind("<KeyRelease>", lambda _e: self.refresh_list())
-
-        box = tk.Frame(left, bg=P["border"], highlightthickness=0)
-        box.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(
-            box, columns=("on", "id", "st"), show="headings", selectmode="browse"
-        )
-        self.tree.heading("on", text="")
-        self.tree.column("on", width=S(30), anchor="center", stretch=False)
-        self.tree.heading("id", text="动作")
-        self.tree.column("id", width=S(190), anchor="w")
-        self.tree.heading("st", text="状态")
-        self.tree.column("st", width=S(48), anchor="center", stretch=False)
-        sb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.tree.pack(side="left", fill="both", expand=True)
-        self.tree.bind("<<TreeviewSelect>>", self._on_select)
-        self.tree.bind("<space>", lambda _e: self._toggle_enabled())
-        self.tree.bind("<Double-1>", lambda _e: self._toggle_enabled())
-
-        lbtn = tk.Frame(left, bg=P["bg"])
-        lbtn.pack(fill="x", pady=(S(8), 0))
-        ttk.Button(lbtn, text="新建", command=self._new).pack(side="left")
-        ttk.Button(lbtn, text="删除", command=self._delete).pack(side="left", padx=S(6))
-        ttk.Button(lbtn, text="↑", width=3, command=lambda: self._move(-1)).pack(side="left")
-        ttk.Button(lbtn, text="↓", width=3, command=lambda: self._move(1)).pack(side="left", padx=(S(4), 0))
-        ttk.Button(lbtn, text="重新检查", style="Ghost.TButton",
-                   command=self.check_all).pack(side="right")
+        panel = W.Panel(left, radius=18, pad=10)
+        panel.pack(fill="both", expand=True)
+        body = panel.body
+        search = W.Field(body, textvariable=self._search, placeholder="搜索动作、说法", icon="search", height=36)
+        search.pack(fill="x")
+        search.entry.bind("<KeyRelease>", lambda _e: self.refresh_list())
+        tools = tk.Frame(body, bg=panel.fill)
+        tools.pack(side="bottom", fill="x", pady=(S(8), 0))
+        W.hline(body, color=P["line"], side="bottom", pady=(S(8), 0))
+        W.IconButton(tools, "plus", self._new, tooltip="新建动作", size=32).pack(side="left")
+        W.IconButton(tools, "trash", self._delete, tooltip="删除这个动作", size=32).pack(side="left", padx=(S(2), 0))
+        W.IconButton(tools, "arrow_up", lambda: self._move(-1), tooltip="上移（越靠前越先匹配）", size=32).pack(
+            side="left", padx=(S(10), 0))
+        W.IconButton(tools, "arrow_down", lambda: self._move(1), tooltip="下移", size=32).pack(
+            side="left", padx=(S(2), 0))
+        W.IconButton(tools, "refresh", self.check_all, tooltip="重新检查每个动作能不能跑通", size=32).pack(side="right")
+        self.list = ActionList(body, on_select=self._select_index, on_toggle=self._toggle_index)
+        self.list.pack(fill="both", expand=True, pady=(S(8), 0))
 
         # --- 右：详情 -----------------------------------------------------
-        self._title = tk.Label(right, text="选一个动作", bg=P["bg"], fg=P["text"],
-                               font=W.theme.FONTS["subtitle"], anchor="w")
-        self._title.pack(fill="x", pady=(0, S(8)))
+        bar = tk.Frame(right, bg=P["chassis"])
+        bar.pack(side="bottom", fill="x")
+        W.hline(bar, color=P["line"])
+        bar_in = tk.Frame(bar, bg=P["chassis"])
+        bar_in.pack(fill="x", pady=(S(12), 0))
+        self._save_btn = W.Button(bar_in, "保存修改", kind="primary", icon="check", command=self._save)
+        self._save_btn.pack(side="left")
+        self._dry_btn = W.Button(bar_in, "试运行", icon="flask", command=lambda: self._try(True))
+        self._dry_btn.pack(side="left", padx=(S(8), 0))
+        self._run_btn = W.Button(bar_in, "真的执行", kind="ghost", icon="play", command=lambda: self._try(False))
+        self._run_btn.pack(side="left", padx=(S(4), 0))
+        W.hint(
+            bar,
+            "改了别忘点「保存修改」——它会写回 config.toml（只动这几行，注释全部保留，"
+            "并留一份 config.toml.bak 备份）。",
+            bg=P["chassis"], font="caption",
+        ).pack(fill="x", pady=(S(8), 0))
+
+        head = tk.Frame(right, bg=P["chassis"])
+        head.pack(fill="x")
+        self._title = tk.Label(head, text="选一个动作", bg=P["chassis"], fg=P["ink"], font=FONTS["title"],
+                               anchor="w")
+        self._title.pack(side="left")
+        self._pre = W.Callout(right, "", "info", gap=(10, 0))
+        self._pre.pack(fill="x")
 
         self.scroll = W.ScrollFrame(right)
-        self.scroll.pack(fill="both", expand=True)
-        pane = tk.Frame(self.scroll.inner, bg=P["bg"])
-        pane.pack(fill="both", expand=True)
+        self.scroll.pack(fill="both", expand=True, pady=(S(10), S(0)))
+        pane = tk.Frame(self.scroll.inner, bg=P["chassis"])
+        pane.pack(fill="both", expand=True, padx=(0, S(6)))
 
         card = W.Card(pane, title="匹配方式")
         card.pack(fill="x")
-        self.form = W.Form(card.body)
-        self.form.pack(fill="x")
-        self.form.add("标识 id", ttk.Entry(self.form, textvariable=self._f_id),
-                      note="唯一名字，只影响配置文件，不影响说话。改它不会动到别的动作。")
-        self.form.add(
-            "说法", ttk.Entry(self.form, textvariable=self._f_aliases),
-            note="你会怎么念它，用逗号分隔。这是别名匹配的依据——写得越像你平时的说法，越不需要靠语义层。",
+        slot = card.row("标识 id", "唯一名字，只影响配置文件，不影响说话。改它不会动到别的动作。")
+        f = W.Field(slot, textvariable=self._f_id, mono=True, width=200)
+        f.pack()
+        self._inputs.append(f)
+        slot = card.row(
+            "说法",
+            "你会怎么念它，用逗号分隔。这是别名匹配的依据——写得越像你平时的说法，越不需要靠语义层。",
+            stack=True,
         )
-        self.form.add("描述", ttk.Entry(self.form, textvariable=self._f_describe),
-                      note="一句话说明它是干什么的。开了语义层后，这句话会被当成判断依据。")
+        f = W.Field(slot, textvariable=self._f_aliases)
+        f.pack(fill="x")
+        self._inputs.append(f)
+        slot = card.row("描述", "一句话说明它是干什么的。开了语义层后，这句话会被当成判断依据。", stack=True)
+        f = W.Field(slot, textvariable=self._f_describe)
+        f.pack(fill="x")
+        self._inputs.append(f)
 
         card2 = W.Card(pane, title="做什么")
-        card2.pack(fill="x", pady=(S(14), 0))
-        f2 = W.Form(card2.body)
-        f2.pack(fill="x")
-        self._target_note = W.hint(f2, HANDLER_TARGET_HINT["open_app"], bg=P["surface"])
-        self._handler_box = ttk.Combobox(
-            f2,
-            textvariable=self._f_handler,
+        card2.pack(fill="x", pady=(S(18), 0))
+        slot = card2.row("类型")
+        self._handler_box = W.Select(
+            slot, variable=self._f_handler, width=320,
             values=[f"{k}（{v}）" for k, v in HANDLER_LABEL.items()],
-            state="readonly",
+            command=lambda _v: self._on_handler_change(),
         )
-        f2.add("类型", self._handler_box)
-        # target 的含义完全取决于 handler，所以提示行紧跟在「类型」下面、
-        # 并且随类型切换而变——写死一句通用的说明等于没说明
-        self._target_note.grid(row=f2._row, column=1, sticky="ew", pady=(0, S(8)))  # noqa: SLF001
-        f2._row += 1  # noqa: SLF001
-        f2.add("目标", ttk.Entry(f2, textvariable=self._f_target))
-        f2.add("参数", ttk.Entry(f2, textvariable=self._f_args),
-               note="命令行参数或键序列，逗号分隔。一般留空。")
-        W.check(f2, "启用（参与语音匹配）", self._f_enabled, bg=P["surface"]).grid(
-            row=f2._row, column=1, sticky="w", pady=(0, S(10))  # noqa: SLF001
-        )
-        f2._row += 1  # noqa: SLF001
-        self._handler_box.bind("<<ComboboxSelected>>", lambda _e: self._on_handler_change())
-
-        row = tk.Frame(card2.body, bg=P["surface"])
-        row.pack(fill="x", pady=(S(4), 0))
-        ttk.Button(row, text="保存修改", style="Primary.TButton", command=self._save).pack(side="left")
-        ttk.Button(row, text="试运行", command=lambda: self._try(True)).pack(side="left", padx=S(8))
-        ttk.Button(row, text="真的执行", command=lambda: self._try(False)).pack(side="left")
-
-        self._pre = tk.Label(card2.body, text="", bg=P["surface"], fg=P["muted"],
-                             font=W.theme.FONTS["small"], anchor="w", justify="left",
-                             wraplength=S(420))
-        self._pre.pack(fill="x", pady=(S(10), 0))
-
-        W.hint(
-            pane,
-            "改了别忘点「保存修改」——它会写回 config.toml（只动这几行，注释全部保留，"
-            "并留一份 config.toml.bak 备份）。",
-        ).pack(fill="x", pady=(S(14), 0))
+        self._handler_box.pack()
+        self._inputs.append(self._handler_box)
+        # target 的含义完全取决于 handler，所以提示跟在「目标」那一行里、并且随类型切换——
+        # 写死一句通用的说明等于没说明
+        slot = card2.row("目标", HANDLER_TARGET_HINT["open_app"], stack=True)
+        self._target_note = card2.last_row.note
+        f = W.Field(slot, textvariable=self._f_target, mono=True)
+        f.pack(fill="x")
+        self._inputs.append(f)
+        slot = card2.row("参数", "命令行参数或键序列，逗号分隔。一般留空。", stack=True)
+        f = W.Field(slot, textvariable=self._f_args, mono=True)
+        f.pack(fill="x")
+        self._inputs.append(f)
+        slot = card2.row("启用（参与语音匹配）", "停用后这个动作还在配置里，只是语音听不到它。")
+        sw = W.Switch(slot, "", self._f_enabled)
+        sw.pack()
+        self._inputs.append(sw)
 
         self._set_enabled_form(False)
 
@@ -203,38 +380,31 @@ class ActionsTab(tk.Frame):
 
     def refresh_list(self, *, keep: int | None = None) -> None:
         want = keep if keep is not None else self._index
-        self.tree.tag_configure("off", foreground=P["faint"])
-        self.tree.delete(*self.tree.get_children())
-        self._rows = {}
+        items = []
         for i, a in self._visible():
             st = self._status.get(a.id)
-            mark = STATUS_GLYPH.get(st[0], "?") if st else "?"
-            iid = self.tree.insert(
-                "", "end",
-                values=("●" if a.enabled else "○", a.id, mark),
-                tags=("off",) if not a.enabled else (),
-            )
-            self._rows[iid] = i
-        if want is not None and want in self._rows.values():
-            for iid, idx in self._rows.items():
-                if idx == want:
-                    self.tree.selection_set(iid)
-                    self.tree.see(iid)
-                    break
+            items.append({
+                "index": i,
+                "id": a.id,
+                "aliases": "、".join(a.aliases),
+                "enabled": a.enabled,
+                "status": st[0] if st else "?",
+            })
+        self.list.set_items(items, want)
 
     def _selected_index(self) -> int | None:
-        sel = self.tree.selection()
-        if not sel:
-            return None
-        return self._rows.get(sel[0])
+        return self.list.selected
+
+    def _select_index(self, idx: int) -> None:
+        self._index = idx
+        self._load_form(self.app.cfg.actions[idx])
+        self._check_one(idx)
 
     def _on_select(self, _e: tk.Event | None = None) -> None:
         idx = self._selected_index()
         if idx is None:
             return
-        self._index = idx
-        self._load_form(self.app.cfg.actions[idx])
-        self._check_one(idx)
+        self._select_index(idx)
 
     # -- 表单 ------------------------------------------------------------- #
 
@@ -253,10 +423,13 @@ class ActionsTab(tk.Frame):
         self._building = False
 
     def _set_enabled_form(self, on: bool) -> None:
-        state = "normal" if on else "disabled"
-        for child in self.form.winfo_children():
-            if isinstance(child, ttk.Entry):
-                child.configure(state=state)
+        for w in self._inputs:
+            if isinstance(w, W.Field):
+                w.set_state("normal" if on else "disabled")
+            else:
+                w.set_enabled(on)
+        for b in (self._save_btn, self._dry_btn, self._run_btn):
+            b.set_enabled(on)
 
     def _on_handler_change(self) -> None:
         if self._building:
@@ -314,6 +487,7 @@ class ActionsTab(tk.Frame):
         if idx is None:
             return
         self._index = idx
+        self._search.set("")
         self.refresh_list(keep=idx)
         self._on_select()
         events.info(
@@ -345,7 +519,7 @@ class ActionsTab(tk.Frame):
         for var in (self._f_id, self._f_aliases, self._f_describe, self._f_target, self._f_args):
             var.set("")
         self._title.configure(text="选一个动作")
-        self._pre.configure(text="")
+        self._pre.set("", "info")
         self._set_enabled_form(False)
         self._building = False
 
@@ -358,18 +532,23 @@ class ActionsTab(tk.Frame):
             self.refresh_list(keep=self._index)
             self._on_select()
 
+    def _toggle_index(self, idx: int) -> None:
+        """列表里点某一行的小开关：启用 ↔ 停用。不改变当前选中的是哪一行。"""
+        a = self.app.cfg.actions[idx]
+        if self.app.save_action(idx, {"enabled": not a.enabled}):
+            if idx == self._index:
+                self._f_enabled.set(not a.enabled)
+            self.refresh_list(keep=self._index)
+            self._pre.set(
+                f"{'已启用' if not a.enabled else '已停用'} {a.id}",
+                "ok" if not a.enabled else "warn",
+            )
+
     def _toggle_enabled(self) -> None:
         idx = self._selected_index()
         if idx is None:
             return
-        a = self.app.cfg.actions[idx]
-        if self.app.save_action(idx, {"enabled": not a.enabled}):
-            self._f_enabled.set(not a.enabled)
-            self.refresh_list(keep=idx)
-            self._pre.configure(
-                text=f"{'已启用' if not a.enabled else '已停用'} {a.id}",
-                fg=P["ok"] if not a.enabled else P["warn"],
-            )
+        self._toggle_index(idx)
 
     # -- 预检 ------------------------------------------------------------- #
 
@@ -377,7 +556,7 @@ class ActionsTab(tk.Frame):
         if self._pending is not None:
             return
         actions = list(self.app.cfg.actions)
-        self._pre.configure(text="正在检查每个动作能不能跑通 …", fg=P["muted"])
+        self._pre.set("正在检查每个动作能不能跑通 …", "info")
 
         def work() -> None:
             out: list[tuple[str, str, str]] = []
@@ -397,19 +576,23 @@ class ActionsTab(tk.Frame):
 
         threading.Thread(target=work, name="voice-ctl-preflight", daemon=True).start()
 
+    def _show_status(self, a: ActionConfig) -> None:
+        st = self._status.get(a.id)
+        if st is None:
+            return
+        self._pre.set(st[1], _STATUS_KIND[st[0]])
+
     def _check_one(self, idx: int) -> None:
         if idx >= len(self.app.cfg.actions):
             return
         a = self.app.cfg.actions[idx]
         if not a.enabled:
-            self._pre.configure(text="这个动作已停用：它还在配置里，但语音不会匹配到它。", fg=P["muted"])
+            self._pre.set("这个动作已停用：它还在配置里，但语音不会匹配到它。", "info")
             return
-        st = self._status.get(a.id)
-        if st is None:
+        if a.id not in self._status:
             self.check_all()
             return
-        color = {"ok": P["ok"], "bad": P["error"], "soft": P["muted"], "?": P["faint"]}[st[0]]
-        self._pre.configure(text=f"{STATUS_GLYPH[st[0]]} {st[1]}", fg=color)
+        self._show_status(a)
 
     # -- 试跑 ------------------------------------------------------------- #
 
@@ -439,11 +622,11 @@ class ActionsTab(tk.Frame):
         self.refresh_list()
         # 一进来就选中第一个：否则右边是一整套空表单，看着像坏了
         if self._index is None and self.app.cfg.actions:
-            first = self.tree.get_children()
+            first = self.list.indices
             if first:
-                self.tree.selection_set(first[0])
-                self.tree.focus(first[0])
-                self._on_select()
+                self.list.select(first[0])
+        elif self._index is not None:
+            self.list.select(self._index, notify=False)
 
     def on_tick(self) -> None:
         if self._pending is not None:
@@ -453,8 +636,4 @@ class ActionsTab(tk.Frame):
             self.refresh_list()
             idx = self._index
             if idx is not None and idx < len(self.app.cfg.actions):
-                a = self.app.cfg.actions[idx]
-                st = self._status.get(a.id)
-                if st:
-                    color = {"ok": P["ok"], "bad": P["error"], "soft": P["muted"], "?": P["faint"]}[st[0]]
-                    self._pre.configure(text=f"{STATUS_GLYPH[st[0]]} {st[1]}", fg=color)
+                self._show_status(self.app.cfg.actions[idx])

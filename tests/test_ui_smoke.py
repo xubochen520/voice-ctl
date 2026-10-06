@@ -96,25 +96,42 @@ def test_run_tab_shows_recording_feedback(app):  # noqa: ANN001
     """按住热键那几秒界面必须有反应。
 
     没有它用户不知道到底在不在录，只能反复点「启动监听」——日志里那串
-    「已启动/已停止」就是这么来的。
+    「已启动/已停止」就是这么来的。现在按下的那一瞬间三处同时变：
+    大字、键帽（真的按下去）、点阵电平；松手后全部恢复。
     """
-    from voice_ctl.ui.theme import PALETTE as P
-
     app.show_tab("run")
     run = app.tabs["run"]
-    assert "未录音" in run._ring_lbl.cget("text")
+    app.engine._set_state("running")  # noqa: SLF001 - 录音态只在监听中才画
+    app.engine.capture_state = lambda: (False, 0.0, 0.0)  # type: ignore[method-assign]
+    run.on_tick()
+    assert run._headline.cget("text") == "待命"
+    assert not run._caps.pressed
+    assert run.meter.lit_count() > 0, "待命时中线上有一道慢扫的青光"
 
     app.engine.capture_state = lambda: (True, 1200.0, 0.5)  # type: ignore[method-assign]
     run.on_tick()
-    text = run._ring_lbl.cget("text")
-    assert "正在录音" in text and "1.2s" in text, text
-    lit = [s for s in run._ring_segs if s.cget("bg") == P["error"]]
-    assert 0 < len(lit) < len(run._ring_segs), "电平条要亮一部分（不该全亮或全灭）"
+    assert run._headline.cget("text") == "正在听"
+    assert "1.2s" in run._sub.cget("text"), run._sub.cget("text")
+    assert run._caps.pressed, "按住热键时屏幕上的键帽也要按下去"
+    assert run.meter.mode == "rec"
+    cells = run.meter._cols * run.meter.ROWS  # noqa: SLF001
+    assert 0 < run.meter.lit_count() < cells, "电平要亮一部分（不该全亮或全灭）"
 
     app.engine.capture_state = lambda: (False, 0.0, 0.0)  # type: ignore[method-assign]
     run.on_tick()
-    assert "未录音" in run._ring_lbl.cget("text")
-    assert not [s for s in run._ring_segs if s.cget("bg") == P["error"]], "松开后电平条要全灭"
+    assert not run._caps.pressed, "松手后键帽要弹起来"
+    assert run.meter.mode != "rec"
+    assert run._headline.cget("text") != "正在听"
+
+
+def test_run_tab_not_recording_when_engine_stopped(app):  # noqa: ANN001
+    """引擎没在监听时，录音器的残留状态不能让界面显示「正在听」。"""
+    app.show_tab("run")
+    run = app.tabs["run"]
+    app.engine.capture_state = lambda: (True, 500.0, 0.4)  # type: ignore[method-assign]
+    run.on_tick()
+    assert run._headline.cget("text") == "未启动"
+    assert not run._caps.pressed
 
 
 def test_model_pill_distinguishes_missing_from_not_loaded(app, cfg_path: Path):  # noqa: ANN001
@@ -128,7 +145,7 @@ def test_model_pill_distinguishes_missing_from_not_loaded(app, cfg_path: Path): 
     # 这个 fixture 的模型目录是空的
     run._model_present = None
     run.on_tick()
-    missing = run._model_pill._text.cget("text")
+    missing = run._model_pill.text
     assert "缺少" in missing
 
     md = cfg_path.parent / "models" / "sense-voice-int8"
@@ -137,7 +154,7 @@ def test_model_pill_distinguishes_missing_from_not_loaded(app, cfg_path: Path): 
     (md / "tokens.txt").write_text("a", encoding="utf-8")
     run._model_present = None
     run.on_tick()
-    present = run._model_pill._text.cget("text")
+    present = run._model_pill.text
     assert "待加载" in present
     assert present != missing
 
@@ -212,7 +229,7 @@ def test_hotkey_capture_shows_and_saves(app):  # noqa: ANN001
     hk = app.tabs["hotkey"]
     hk._on_captured("<ctrl>+<alt>+j")
     pump(app, 4)
-    assert hk._msg.cget("text").startswith("✓")
+    assert hk._msg.kind == "ok", hk._msg.text
     hk._save()
     pump(app, 8)
     assert app.cfg.hotkey.keys == "<ctrl>+<alt>+j"
@@ -248,7 +265,7 @@ def test_actions_tab_lists_and_autoselects(app):  # noqa: ANN001
     app.show_tab("actions")
     pump(app, 6)
     a = app.tabs["actions"]
-    assert len(a.tree.get_children()) == 3
+    assert a.list.count == 3
     assert a._f_id.get() == "open.notepad"
     assert a._f_aliases.get().startswith("记事本")
 

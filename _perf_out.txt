@@ -1,0 +1,16 @@
+构建 1466 ms；RSS 42 → 117 MB
+控件总数 625；PhotoImage 数 145
+  切到 logs         155 ms
+  切到 hotkey       413 ms
+  切到 actions      527 ms
+  切到 settings    3440 ms
+  切到 about        441 ms
+  切到 run          121 ms
+CPU（运行页·未启动·空闲）     1.6%
+CPU（运行页·待命·青光慢扫）   2.7%
+CPU（运行页·录音·~30fps）    12.9%
+CPU（设置页·空闲）            2.0%
+CPU（最小化·待命）            0.0%
+灌入 4000 条日志并显示 1515 ms；缓冲 3003，显示 3003
+切换过滤重绘 238 ms
+RSS 结束 320 MB

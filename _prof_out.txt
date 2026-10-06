@@ -1,0 +1,76 @@
+==================== build_window
+         385220 function calls (383742 primitive calls) in 1.575 seconds
+
+   Ordered by: cumulative time
+   List reduced from 1060 to 28 due to restriction <28>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000    0.984    0.984 runner.py:115(build_runtime)
+        1    0.000    0.000    0.819    0.819 apps.py:237(entries)
+        1    0.000    0.000    0.819    0.819 apps.py:242(_build)
+      2/1    0.000    0.000    0.810    0.810 appfind.py:155(start_apps)
+      4/1    0.000    0.000    0.810    0.810 threading.py:1018(_bootstrap)
+      4/1    0.000    0.000    0.810    0.810 threading.py:1058(_bootstrap_inner)
+      3/1    0.000    0.000    0.810    0.810 threading.py:1001(run)
+        1    0.000    0.000    0.810    0.810 subprocess.py:506(run)
+        1    0.000    0.000    0.798    0.798 subprocess.py:1165(communicate)
+        1    0.000    0.000    0.790    0.790 subprocess.py:1603(_communicate)
+        2    0.000    0.000    0.789    0.395 threading.py:1117(join)
+    38/16    0.000    0.000    0.789    0.049 {method 'acquire' of '_thread.lock' objects}
+        3    0.000    0.000    0.789    0.263 threading.py:1155(_wait_for_tstate_lock)
+      6/5    0.000    0.000    0.789    0.158 {method 'close' of '_io.TextIOWrapper' objects}
+      2/1    0.000    0.000    0.789    0.789 subprocess.py:1598(_readerthread)
+        1    0.000    0.000    0.307    0.307 window.py:145(_build_content)
+     4976    0.293    0.000    0.293    0.000 {method 'call' of '_tkinter.tkapp' objects}
+        1    0.000    0.000    0.171    0.171 __init__.py:2326(__init__)
+        1    0.171    0.171    0.171    0.171 {built-in method _tkinter.create}
+        1    0.000    0.000    0.163    0.163 matcher.py:144(__init__)
+      120    0.000    0.000    0.162    0.001 normalize.py:101(fuzzy_key)
+     44/3    0.000    0.000    0.162    0.054 <frozen importlib._bootstrap>:1349(_find_and_load)
+     44/3    0.000    0.000    0.161    0.054 <frozen importlib._bootstrap>:1304(_find_and_load_unlocked)
+     44/3    0.000    0.000    0.160    0.053 <frozen importlib._bootstrap>:911(_load_unlocked)
+     42/3    0.000    0.000    0.160    0.053 <frozen importlib._bootstrap_external>:993(exec_module)
+    106/5    0.000    0.000    0.159    0.032 <frozen importlib._bootstrap>:480(_call_with_frames_removed)
+     52/4    0.001    0.000    0.159    0.040 {built-in method builtins.exec}
+        5    0.000    0.000    0.158    0.032 __init__.py:1(<module>)
+
+
+
+==================== show_tab(settings)
+         1208981 function calls (1182819 primitive calls) in 2.398 seconds
+
+   Ordered by: cumulative time
+   List reduced from 4624 to 28 due to restriction <28>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+       17    0.001    0.000    4.161    0.245 _jit_internal.py:1047(_overload)
+      165    0.004    0.000    2.973    0.018 __init__.py:1(<module>)
+ 1150/431    0.419    0.000    0.433    0.001 {method 'call' of '_tkinter.tkapp' objects}
+        1    0.000    0.000    0.418    0.418 __init__.py:1371(update)
+      116    0.000    0.000    0.354    0.003 library.py:330(_register_fake)
+      116    0.001    0.000    0.353    0.003 fake_impl.py:38(register)
+      116    0.000    0.000    0.341    0.003 utils.py:36(get_source)
+      116    0.001    0.000    0.340    0.003 inspect.py:1688(getframeinfo)
+      146    0.001    0.000    0.340    0.002 inspect.py:1070(findsource)
+        2    0.000    0.000    0.320    0.160 library.py:1268(register)
+  364/362    0.004    0.000    0.319    0.001 inspect.py:988(getmodule)
+        1    0.000    0.000    0.304    0.304 runtime_assert.py:1(<module>)
+        1    0.000    0.000    0.302    0.302 proxy_tensor.py:1(<module>)
+      885    0.006    0.000    0.281    0.000 <frozen importlib._bootstrap_external>:1066(get_code)
+     1184    0.004    0.000    0.275    0.000 <frozen ntpath>:705(realpath)
+     2381    0.261    0.000    0.261    0.000 {built-in method nt._getfinalpathname}
+    861/4    0.002    0.000    0.248    0.062 <frozen importlib._bootstrap>:911(_load_unlocked)
+    846/4    0.003    0.000    0.247    0.062 <frozen importlib._bootstrap_external>:993(exec_module)
+   2029/8    0.002    0.000    0.247    0.031 <frozen importlib._bootstrap>:480(_call_with_frames_removed)
+   1893/4    0.068    0.000    0.246    0.061 {built-in method builtins.exec}
+   243/53    0.002    0.000    0.244    0.005 _ops.py:379(fallthrough)
+      918    0.006    0.000    0.215    0.000 <frozen importlib._bootstrap>:1240(_find_spec)
+      911    0.001    0.000    0.203    0.000 <frozen importlib._bootstrap_external>:1524(find_spec)
+      911    0.002    0.000    0.202    0.000 <frozen importlib._bootstrap_external>:1495(_get_spec)
+    898/3    0.005    0.000    0.178    0.059 <frozen importlib._bootstrap>:1349(_find_and_load)
+    898/3    0.004    0.000    0.178    0.059 <frozen importlib._bootstrap>:1304(_find_and_load_unlocked)
+        1    0.169    0.169    0.172    0.172 __init__.py:182(_load_dll_libraries)
+        2    0.000    0.000    0.171    0.086 batchnorm.py:1(<module>)
+
+
+

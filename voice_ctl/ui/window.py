@@ -1,9 +1,12 @@
-"""主窗口：顶栏状态 + 左侧导航 + 内容区 + 底栏控制。
+"""主窗口：左侧导航栏（品牌 + 页面 + 电源键）+ 内容区。
 
 线程模型很简单，只有一条规则：**Tk 只能被主线程碰**。
 worker 线程（识别、预检、下载）只往事件总线里丢事件或往一个槽里放结果，
 主线程每 120ms 轮询一次再更新界面。这样就不需要任何锁，也不会出现
 「窗口偶尔卡死」那类只在用户机器上复现的问题。
+
+窗口里没有顶栏和底栏：状态与启停都收进了侧栏底部的电源键（任何页面都在），
+内容区因此多出一整条高度——以前底栏就是被内容挤出窗口的那一块。
 """
 
 from __future__ import annotations
@@ -12,7 +15,6 @@ import threading
 import tkinter as tk
 from collections.abc import Callable
 from pathlib import Path
-from tkinter import ttk
 from typing import Any
 
 from .. import __version__, bootstrap, events
@@ -20,7 +22,7 @@ from ..actions import HANDLERS, ActionContext
 from ..config import ActionConfig, AppConfig, ConfigError, load_config
 from ..confedit import ConfigEditor
 from ..runner import Engine
-from . import theme, widgets as W
+from . import gfx, inputs, theme, widgets as W
 from .tab_actions import ActionsTab
 from .tab_about import AboutTab
 from .tab_hotkey import HotkeyTab
@@ -33,19 +35,21 @@ from .theme import S
 POLL_MS = 120
 
 NAV = [
-    ("run", "运行", "▶"),
-    ("logs", "日志", "≡"),
-    ("hotkey", "快捷键", "⌨"),
-    ("actions", "功能", "✦"),
-    ("settings", "设置", "⚙"),
-    ("about", "关于", "ⓘ"),
+    ("run", "运行", "mic"),
+    ("logs", "日志", "list"),
+    ("hotkey", "快捷键", "keyboard"),
+    ("actions", "功能", "bolt"),
+    ("settings", "设置", "sliders"),
+    ("about", "关于", "info"),
 ]
+
+RAIL_W = 100
 
 
 class App:
     """窗口控制器。页面通过它访问引擎、配置和状态栏。"""
 
-    def __init__(self, root: tk.Tk, cfg: AppConfig, config_path: Path | None) -> None:
+    def __init__(self, root: tk.Misc, cfg: AppConfig, config_path: Path | None) -> None:
         self.root = root
         self.cfg = cfg
         self.config_path = config_path
@@ -64,75 +68,86 @@ class App:
     # 构建
     # ------------------------------------------------------------------ #
 
-    def build(self) -> None:
-        self._build_header()
-        body = tk.Frame(self.root, bg=P["bg"])
-        body.pack(fill="both", expand=True)
-        self._build_sidebar(body)
-        self._build_content(body)
-        self._build_footer()
+    def build(self, *, show_first: bool = False) -> None:
+        inputs.install_wheel_router(self.root)
+        self._set_icon()
+        self._build_rail()
+        self._build_content()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.show_tab("run")
+        if show_first:
+            # Engine.prepare() 要 ~1 秒（第一次扫「开始菜单」要起一个 PowerShell）。
+            # 不先画出来的话，用户双击之后要干等一秒多才看到窗口，像是没启动
+            self.root.update()
         self.engine.prepare()
-        # 映射之后再设一次深色标题栏：有些 Windows 版本在窗口可见前设了不生效
+        # 映射之后再设一次标题栏配色：有些 Windows 版本在窗口可见前设了不生效
         self.root.after(80, self._late_polish)
         self._poll()
 
     def _late_polish(self) -> None:
         events.debug(
-            f"深色标题栏：{'已生效' if theme.apply_dark_titlebar(self.root) else '未生效（只影响观感）'}",
+            f"标题栏配色：{'已生效' if theme.apply_titlebar(self.root) else '未生效（只影响观感）'}",
             kind="ui",
         )
 
-    def _build_header(self) -> None:
-        head = tk.Frame(self.root, bg=P["surface"], height=S(64))
-        head.pack(fill="x")
-        head.pack_propagate(False)
-        W.hline(self.root, soft=True)
+    def _set_icon(self) -> None:
+        """窗口/任务栏图标。不设的话标题栏上是 Tk 默认的那根羽毛。"""
+        try:
+            imgs = [gfx.app_icon(self.root, s) for s in (16, 24, 32, 48, 64)]
+            self.root.iconphoto(True, *imgs)
+        except tk.TclError:  # pragma: no cover - 个别环境不支持
+            pass
 
-        left = tk.Frame(head, bg=P["surface"])
-        left.pack(side="left", fill="y", padx=S(18))
-        title = tk.Frame(left, bg=P["surface"])
-        title.pack(anchor="w", pady=(S(12), 0))
-        tk.Label(title, text="voice-ctl", bg=P["surface"], fg=P["text"],
-                 font=theme.FONTS["title"]).pack(side="left")
-        tk.Label(title, text=f" {__version__} ", bg=P["surface2"], fg=P["muted"],
-                 font=theme.FONTS["tiny"], padx=S(4), pady=S(1)).pack(side="left", padx=S(8))
-        self._subtitle = tk.Label(
-            left, text="按住快捷键说话 → 本地离线识别 → 执行", bg=P["surface"],
-            fg=P["faint"], font=theme.FONTS["tiny"],
-        )
-        self._subtitle.pack(anchor="w")
+    def _build_rail(self) -> None:
+        rail = tk.Frame(self.root, bg=P["chassis"], width=S(RAIL_W))
+        rail.pack(side="left", fill="y")
+        rail.pack_propagate(False)
+        self._rail = rail
 
-        right = tk.Frame(head, bg=P["surface"])
-        right.pack(side="right", fill="y", padx=S(18))
-        self._state_pill = W.StatusPill(right, "未启动", color=P["faint"])
-        self._state_pill.pack(anchor="e", pady=(S(14), 0))
-        self._hot_lbl = tk.Label(right, text="", bg=P["surface"], fg=P["faint"],
-                                 font=theme.FONTS["tiny"])
-        self._hot_lbl.pack(anchor="e")
+        # 底部先 pack：窗口矮的时候被裁掉的该是中间的空白，而不是电源键
+        foot = tk.Frame(rail, bg=P["chassis"])
+        foot.pack(side="bottom", fill="x", pady=(0, S(18)))
+        self._power = W.PowerButton(foot, command=self.toggle_engine)
+        self._power.pack()
+        self._state_lbl = tk.Label(foot, text="待命", bg=P["chassis"], fg=P["ink3"], font=theme.FONTS["nav_b"])
+        self._state_lbl.pack(pady=(S(4), 0))
+        self._hot_lbl = tk.Label(foot, text="", bg=P["chassis"], fg=P["ink3"], font=theme.FONTS["caption"])
+        self._hot_lbl.pack()
 
-    def _build_sidebar(self, parent: tk.Frame) -> None:
-        side = tk.Frame(parent, bg=P["surface"], width=S(158))
-        side.pack(side="left", fill="y")
-        side.pack_propagate(False)
-        tk.Frame(parent, bg=P["border"], width=1).pack(side="left", fill="y")
-        self._side = side
+        # 品牌：标志永远在；字标和版本号在侧栏太矮放不下时收起（见 _on_rail_configure）
+        self._brand = tk.Frame(rail, bg=P["chassis"])
+        self._brand.pack(pady=(S(24), S(22)))
+        tk.Label(self._brand, image=gfx.app_icon(self.root, S(40)), bg=P["chassis"], bd=0).pack()
+        self._brand_text = tk.Frame(self._brand, bg=P["chassis"])
+        self._brand_text.pack()
+        tk.Label(self._brand_text, text="voice-ctl", bg=P["chassis"], fg=P["ink"],
+                 font=theme.FONTS["brand_s"]).pack(pady=(S(8), 0))
+        tk.Label(self._brand_text, text=__version__, bg=P["chassis"], fg=P["ink3"],
+                 font=theme.FONTS["caption"]).pack()
+        self._compact = False
+        rail.bind("<Configure>", self._on_rail_configure)
 
         for key, label, glyph in NAV:
-            item = W.NavItem(side, label, glyph=glyph, command=lambda k=key: self.show_tab(k))
-            item.pack(fill="x")
+            item = W.NavItem(rail, label, icon=glyph, command=lambda k=key: self.show_tab(k))
+            item.pack(pady=S(2))
             self._nav[key] = item
 
-        foot = tk.Frame(side, bg=P["surface"])
-        foot.pack(side="bottom", fill="x", pady=S(10))
-        tk.Label(
-            foot, text="纯本地离线\n不联网、零调用成本", bg=P["surface"], fg=P["faint"],
-            font=theme.FONTS["tiny"], justify="left",
-        ).pack(anchor="w", padx=S(14))
+    def _on_rail_configure(self, e: tk.Event) -> None:
+        """侧栏矮于 ~670（设计像素）就进紧凑模式：收起字标和版本号，不然最后一项「关于」会被电源键盖住。
+        完整布局要 ~656 高：品牌 130 + 六个导航 408 + 电源键区 118。"""
+        compact = e.height < S(670)
+        if compact == self._compact:
+            return
+        self._compact = compact
+        if compact:
+            self._brand_text.pack_forget()
+            self._brand.pack_configure(pady=(S(14), S(10)))
+        else:
+            self._brand_text.pack()
+            self._brand.pack_configure(pady=(S(24), S(22)))
 
-    def _build_content(self, parent: tk.Frame) -> None:
-        self._content = tk.Frame(parent, bg=P["bg"])
+    def _build_content(self) -> None:
+        self._content = tk.Frame(self.root, bg=P["chassis"])
         self._content.pack(side="left", fill="both", expand=True)
         self.tabs = {
             "run": RunTab(self._content, self),
@@ -142,26 +157,6 @@ class App:
             "settings": SettingsTab(self._content, self),
             "about": AboutTab(self._content, self),
         }
-
-    def _build_footer(self) -> None:
-        W.hline(self.root, soft=True)
-        foot = tk.Frame(self.root, bg=P["surface"], height=S(52))
-        foot.pack(fill="x")
-        foot.pack_propagate(False)
-
-        left = tk.Frame(foot, bg=P["surface"])
-        left.pack(side="left", fill="y", padx=S(18))
-        self._btn_toggle = ttk.Button(left, text="启动监听", style="Primary.TButton",
-                                      command=self.toggle_engine)
-        self._btn_toggle.pack(side="left", pady=S(11))
-        self._btn_model = ttk.Button(left, text="加载模型", command=self.load_model)
-        self._btn_model.pack(side="left", padx=S(8))
-
-        right = tk.Frame(foot, bg=P["surface"])
-        right.pack(side="right", fill="y", padx=S(18))
-        self._stats_lbl = tk.Label(right, text="", bg=P["surface"], fg=P["muted"],
-                                   font=theme.FONTS["small"])
-        self._stats_lbl.pack(side="right", pady=S(16))
 
     # ------------------------------------------------------------------ #
     # 页面切换
@@ -214,29 +209,21 @@ class App:
 
     def _refresh_chrome(self) -> None:
         eng = self.engine
-        self._state_pill.set(eng.state_label, W.STATE_COLOR.get(eng.state, P["muted"]))
-        self._hot_lbl.configure(text=self._nav_hint())
-        self._stats_lbl.configure(text=eng.status_line())
-        running = eng.running
-        self._btn_toggle.configure(
-            text="停止监听" if running else "启动监听",
-            style="TButton" if running else "Primary.TButton",
-        )
-        self._btn_model.state(["disabled"] if eng.model_loaded else ["!disabled"])
-
-        nav = self._nav["logs"]
-        label = "日志"
-        nav.set_text(f"{label}  ●{self._badge}" if self._badge else label)
-
-    def _nav_hint(self) -> str:
-        eng = self.engine
-        if eng.state == "running":
-            return f"按住 {eng.hotkey_spec} 说话"
-        if eng.state == "loading":
-            return "正在加载模型 …"
-        if eng.state == "error":
-            return eng.error[:80]
-        return f"热键 {eng.hotkey_spec}（未监听）"
+        live = bool(eng.running and eng.capture_state()[0])
+        self._power.set_state(eng.state, live=live)
+        if live:
+            text, color = "正在录音", P["live_ink"]
+        else:
+            text = eng.state_label
+            color = {"running": P["ok"], "loading": P["warn"], "error": P["err"]}.get(eng.state, P["ink3"])
+        if self._state_lbl.cget("text") != text:
+            self._state_lbl.configure(text=text)
+        self._state_lbl.configure(fg=color)
+        hot = W.hotkey_text(eng.hotkey_spec)
+        if self._hot_lbl.cget("text") != hot:
+            self._hot_lbl.configure(text=hot)
+            self._power.set_tooltip(f"开始 / 停止监听 · 热键 {hot}")
+        self._nav["logs"].set_badge(self._badge)
 
     # ------------------------------------------------------------------ #
     # 引擎
@@ -492,6 +479,7 @@ def build_window(
     *,
     dry_run: bool = False,
     root: tk.Misc | None = None,
+    show_first: bool = False,
 ) -> App:
     """建窗口并完成主题初始化。调用方负责 mainloop()。
 
@@ -506,14 +494,14 @@ def build_window(
     root.title(f"voice-ctl {__version__}")
     # theme.init 必须先跑：它才会从实际显示器算出 SCALE，之后 S() 才是对的。
     # 反过来的话在 150% 缩放的屏幕上窗口只有应有大小的三分之二，内容直接被裁掉。
-    # 传入已有 root 时也要调——字体表和 ttk 样式是模块级的，不初始化就是空的。
+    # 传入已有 root 时也要调——字体表和配色是模块级的，不初始化就是空的。
     theme.init(root)
     if owns_root:
-        root.minsize(S(940), S(600))
-        root.geometry(f"{S(1080)}x{S(720)}")
-    theme.apply_dark_titlebar(root)
+        root.minsize(S(980), S(640))
+        root.geometry(f"{S(1120)}x{S(760)}")
+    theme.apply_titlebar(root)
     app = App(root, cfg, config_path)
     app.dry_run = dry_run
     app.engine.dry_run = dry_run
-    app.build()
+    app.build(show_first=show_first)
     return app

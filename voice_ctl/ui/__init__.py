@@ -63,7 +63,7 @@ def run_ui(config_path: str | Path | None = None, *, dry_run: bool = False) -> i
     from .window import build_window
 
     try:
-        app = build_window(cfg, path, dry_run=dry_run)
+        app = build_window(cfg, path, dry_run=dry_run, show_first=True)
     except Exception as e:  # noqa: BLE001
         import traceback
 

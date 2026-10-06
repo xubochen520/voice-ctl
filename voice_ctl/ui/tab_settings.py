@@ -1,7 +1,10 @@
 """「设置」页：把 config.toml 里那些值得调的项做成控件。
 
 原则：**只暴露用户真的会调的**。像 samplerate / channels 这种改了就坏的，
-只读展示 + 说明为什么不给改——给出一个能改坏的旋钮是不负责任。
+不给改——给出一个能改坏的旋钮是不负责任。
+
+「保存」条固定在页面底部（不随内容滚动）：页面很长，保存按钮要是跟着滚走，
+用户改完最后一项还得先找一遍按钮在哪。
 """
 
 from __future__ import annotations
@@ -10,12 +13,12 @@ import copy
 import threading
 import tkinter as tk
 from dataclasses import replace
-from tkinter import ttk
 from typing import Any
 
 from .. import events
 from ..config import AppConfig
 from . import widgets as W
+from .theme import FONTS
 from .theme import PALETTE as P
 from .theme import S
 
@@ -42,26 +45,26 @@ class NumberRow(tk.Frame):
         width: int = 8,
         unit: str = "",
         command: Any = None,
+        slider_width: int = 200,
     ) -> None:
-        super().__init__(master, bg=P["surface"])
+        bg = W.bg_of(master)
+        super().__init__(master, bg=bg)
         self.var = tk.DoubleVar()
         self.text = tk.StringVar()
         self._fmt = fmt
         self._step = step
         self._command = command
 
-        self.scale = ttk.Scale(
-            self, from_=from_, to=to, orient="horizontal", variable=self.var,
-            command=self._from_scale,
-        )
-        self.scale.pack(side="left", fill="x", expand=True)
-        self.entry = ttk.Entry(self, textvariable=self.text, width=width)
-        self.entry.pack(side="left", padx=(S(8), 0))
-        self.entry.bind("<Return>", self._to_scale)
-        self.entry.bind("<FocusOut>", self._to_scale)
+        self.scale = W.Slider(self, from_=from_, to=to, variable=self.var, command=self._from_scale)
+        self.scale.configure(width=S(slider_width))
+        self.scale.pack(side="left")
+        self.entry = W.Field(self, textvariable=self.text, width=max(64, width * 9), height=34, justify="right",
+                             font="digits")
+        self.entry.pack(side="left", padx=(S(12), 0))
+        self.entry.entry.bind("<Return>", self._to_scale)
+        self.entry.entry.bind("<FocusOut>", self._to_scale)
         if unit:
-            tk.Label(self, text=unit, bg=P["surface"], fg=P["faint"],
-                     font=W.theme.FONTS["tiny"]).pack(side="left", padx=(S(4), 0))
+            tk.Label(self, text=unit, bg=bg, fg=P["ink3"], font=FONTS["note"]).pack(side="left", padx=(S(6), 0))
 
     def set(self, value: float) -> None:
         self.var.set(float(value))
@@ -91,7 +94,7 @@ class NumberRow(tk.Frame):
 
 class SettingsTab(tk.Frame):
     def __init__(self, master: tk.Misc, app: Any) -> None:
-        super().__init__(master, bg=P["bg"])
+        super().__init__(master, bg=P["chassis"])
         self.app = app
         self._devices: list[tuple[int, str, int, bool]] = []
 
@@ -117,170 +120,138 @@ class SettingsTab(tk.Frame):
         self._reload_after: str | None = None
         """后台任务的结果槽。worker 只写它，主线程在 on_tick 里消费——
         见 window.py 顶部的线程规则。"""
+        self._decision_result: tuple[bool, str] | None = None
+        self._decision_busy = False
 
         self._build()
 
     # -- 构建 ------------------------------------------------------------- #
 
     def _build(self) -> None:
+        # 保存条先 pack 到底部，滚动区再吃掉剩下的高度
+        bar = tk.Frame(self, bg=P["chassis"])
+        bar.pack(side="bottom", fill="x")
+        W.hline(bar, color=P["line"])
+        inner = tk.Frame(bar, bg=P["chassis"])
+        inner.pack(fill="x", padx=S(28), pady=(S(12), S(12)))
+        W.Button(inner, "保存全部修改", kind="primary", icon="check", command=self._save).pack(side="left")
+        W.Button(inner, "放弃修改", icon="undo", command=self.load_from_config).pack(side="left", padx=S(8))
+        W.Button(inner, "重新加载配置文件", kind="ghost", icon="refresh", command=self.app.reload_config).pack(
+            side="left")
+        W.Button(inner, "打开所在文件夹", kind="ghost", icon="folder", command=self._open_config_dir).pack(side="right")
+        W.Button(inner, "打开 config.toml", kind="ghost", icon="file", command=self._open_config).pack(
+            side="right", padx=(0, S(4)))
+        tk.Label(bar, textvariable=self._status, bg=P["chassis"], fg=P["ink3"], font=FONTS["caption"],
+                 anchor="w").pack(fill="x", padx=S(28), pady=(0, S(10)))
+
         wrap = W.ScrollFrame(self)
         wrap.pack(fill="both", expand=True)
         self._scroll = wrap
-        root = tk.Frame(wrap.inner, bg=P["bg"])
-        root.pack(fill="both", expand=True, padx=S(18), pady=S(18))
+        root = tk.Frame(wrap.inner, bg=P["chassis"])
+        root.pack(fill="both", expand=True, padx=S(28), pady=S(26))
 
         # --- 音频 ---------------------------------------------------------
         c1 = W.Card(root, title="麦克风")
         c1.pack(fill="x")
-        f1 = W.Form(c1.body)
-        f1.pack(fill="x")
-        drow = tk.Frame(f1, bg=P["surface"])
-        self._device_box = ttk.Combobox(drow, textvariable=self._device, state="readonly")
-        self._device_box.pack(side="left", fill="x", expand=True)
-        ttk.Button(drow, text="刷新", command=self.reload_devices).pack(side="left", padx=(S(8), 0))
-        f1.add("输入设备", drow, note="留「系统默认」就用 Windows 当前默认麦克风。")
-        self._min_peak = NumberRow(f1, from_=0.0, to=0.1, fmt="{:.3f}")
-        f1.add(
-            "静音阈值", self._min_peak,
-            note="整段录音的「峰值」低于它就当没说话，直接跳过识别。0 = 关闭过滤。\n"
-                 "为什么用峰值不用音量均值：安静环境里正常说话的均值可能只有 0.002，和底噪同级，"
-                 "用它当阈值会把小声说话静默丢掉——表现是「有时候说了没反应」，极难排查。",
+        slot = c1.row("输入设备", "留「系统默认」就用 Windows 当前默认麦克风。")
+        self._device_box = W.Select(slot, variable=self._device, width=300)
+        self._device_box.pack(side="left")
+        W.Button(slot, "刷新", icon="refresh", command=self.reload_devices).pack(side="left", padx=(S(8), 0))
+        slot = c1.row(
+            "静音阈值",
+            "整段录音的「峰值」低于它就当没说话，直接跳过识别。0 = 关闭过滤。\n"
+            "为什么用峰值不用音量均值：安静环境里正常说话的均值可能只有 0.002，和底噪同级，"
+            "用它当阈值会把小声说话静默丢掉——表现是「有时候说了没反应」，极难排查。",
         )
+        self._min_peak = NumberRow(slot, from_=0.0, to=0.1, fmt="{:.3f}")
+        self._min_peak.pack()
 
         # --- 识别 ---------------------------------------------------------
         c2 = W.Card(root, title="识别模型")
-        c2.pack(fill="x", pady=(S(14), 0))
-        f2 = W.Form(c2.body)
-        f2.pack(fill="x")
-        mrow = tk.Frame(f2, bg=P["surface"])
-        ttk.Entry(mrow, textvariable=self._model_dir).pack(side="left", fill="x", expand=True)
-        ttk.Button(mrow, text="打开目录", command=lambda: self._open(self._model_dir.get())).pack(
-            side="left", padx=(S(8), 0)
-        )
-        f2.add("模型目录", mrow)
-        self._model_status = tk.Label(f2, text="", bg=P["surface"], fg=P["muted"],
-                                      font=W.theme.FONTS["small"], anchor="w")
-        self._model_status.grid(row=f2._row, column=1, sticky="ew", pady=(0, S(10)))  # noqa: SLF001
-        f2._row += 1  # noqa: SLF001
-
-        f2.add("语言", ttk.Combobox(f2, textvariable=self._language, values=LANGUAGES,
-                                    state="readonly"),
-               note="实测对本模型输出无影响（zh/auto/en 结果完全一致），保持 auto 即可。")
-        W.check(f2, "数字与标点正常化（use_itn）", self._itn, bg=P["surface"]).grid(
-            row=f2._row, column=1, sticky="w", pady=(0, S(10))  # noqa: SLF001
-        )
-        f2._row += 1  # noqa: SLF001
-        f2.add("线程数", ttk.Spinbox(f2, from_=1, to=16, textvariable=self._threads, width=8),
-               note="CPU 推理线程。本机实测 2 线程已经比实时快 20 倍以上，调高收益很小。")
-        f2.add("推理后端", ttk.Combobox(f2, textvariable=self._provider, values=PROVIDERS,
-                                        state="readonly"),
-               note="cpu 最省事。cuda 需要装 onnxruntime-gpu，本机实测没必要。")
-        drow2 = tk.Frame(c2.body, bg=P["surface"])
-        drow2.pack(fill="x", pady=(S(4), 0))
-        self._dl_btn = ttk.Button(drow2, text="下载识别模型（约 226MB）", command=self._download_model)
-        self._dl_btn.pack(side="left")
-        ttk.Button(drow2, text="用样例音频验证", command=self._test_asr).pack(side="left", padx=S(8))
+        c2.pack(fill="x", pady=(S(18), 0))
+        slot = c2.row("模型目录", stack=True)
+        mrow = tk.Frame(slot, bg=c2.fill)
+        mrow.pack(fill="x")
+        self._model_field = W.Field(mrow, textvariable=self._model_dir, mono=True)
+        self._model_field.pack(side="left", fill="x", expand=True)
+        W.Button(mrow, "打开目录", icon="folder",
+                 command=lambda: self._open(self._model_dir.get())).pack(side="left", padx=(S(8), 0))
+        self._model_status = W.Callout(slot, "", "info", gap=(10, 0))
+        self._model_status.pack(fill="x")
+        slot = c2.row("语言", "实测对本模型输出无影响（zh/auto/en 结果完全一致），保持 auto 即可。")
+        W.Select(slot, variable=self._language, values=LANGUAGES, width=180).pack()
+        slot = c2.row("数字与标点正常化（use_itn）", "把「九点」写成「9点」这类。")
+        W.Switch(slot, "", self._itn).pack()
+        slot = c2.row("线程数", "CPU 推理线程。本机实测 2 线程已经比实时快 20 倍以上，调高收益很小。")
+        W.Stepper(slot, variable=self._threads, from_=1, to=16, step=1, width=130).pack()
+        slot = c2.row("推理后端", "cpu 最省事。cuda 需要装 onnxruntime-gpu，本机实测没必要。")
+        W.Select(slot, variable=self._provider, values=PROVIDERS, width=180).pack()
+        foot = tk.Frame(c2.body, bg=c2.fill)
+        foot.pack(fill="x", pady=(S(4), 0))
+        self._dl_btn = W.Button(foot, "下载识别模型（约 226MB）", icon="download", command=self._download_model)
+        self._dl_btn.pack(side="right")
+        W.Button(foot, "用样例音频验证", kind="ghost", icon="play", command=self._test_asr).pack(
+            side="right", padx=(0, S(8)))
 
         # --- 匹配 ---------------------------------------------------------
         c3 = W.Card(root, title="匹配")
-        c3.pack(fill="x", pady=(S(14), 0))
-        f3 = W.Form(c3.body)
-        f3.pack(fill="x")
-        self._threshold = NumberRow(f3, from_=0, to=100, fmt="{:.0f}", width=6)
-        f3.add(
-            "相似度阈值", self._threshold,
-            note="0-100，越高越严格。调低会更容易命中，但也更容易把不相干的话认成命令。",
-        )
-        f3.add("剥离前缀", ttk.Entry(f3, textvariable=self._prefixes),
-               note="识别结果开头要丢掉的客气话，逗号分隔。")
-        f3.add("剥离后缀", ttk.Entry(f3, textvariable=self._suffixes),
-               note="结尾的语气词，逗号分隔。")
+        c3.pack(fill="x", pady=(S(18), 0))
+        slot = c3.row("相似度阈值", "0-100，越高越严格。调低会更容易命中，但也更容易把不相干的话认成命令。")
+        self._threshold = NumberRow(slot, from_=0, to=100, fmt="{:.0f}", width=6)
+        self._threshold.pack()
+        slot = c3.row("剥离前缀", "识别结果开头要丢掉的客气话，逗号分隔。", stack=True)
+        W.Field(slot, textvariable=self._prefixes).pack(fill="x")
+        slot = c3.row("剥离后缀", "结尾的语气词，逗号分隔。", stack=True)
+        W.Field(slot, textvariable=self._suffixes).pack(fill="x")
 
         # --- 语义层 -------------------------------------------------------
         c4 = W.Card(root, title="语义层（可选，让口语化说法也能命中）")
-        c4.pack(fill="x", pady=(S(14), 0))
-        f4 = W.Form(c4.body)
-        f4.pack(fill="x")
-        W.check(f4, "启用语义决策", self._decision_on, bg=P["surface"]).grid(
-            row=f4._row, column=1, sticky="w", pady=(0, S(10))  # noqa: SLF001
-        )
-        f4._row += 1  # noqa: SLF001
-        f4.add("权重目录", ttk.Entry(f4, textvariable=self._onnx_dir),
-               note="相对路径按 config.toml 所在目录解析。")
-        f4.add("checkpoint", ttk.Combobox(f4, textvariable=self._decision_model,
-                                          values=DECISION_MODELS, state="readonly"),
-               note="中文务必用 multilingual——用 english 的中文判断接近随机。")
-        self._confidence = NumberRow(f4, from_=0.0, to=1.0, fmt="{:.2f}", width=6)
-        f4.add("置信度下限", self._confidence,
-               note="低于它就不执行，只在日志里说明。实测负样本落在 0.589，所以默认 0.6。")
-        self._decision_status = tk.Label(f4, text="", bg=P["surface"], fg=P["muted"],
-                                         font=W.theme.FONTS["small"], anchor="w",
-                                         justify="left", wraplength=S(520))
-        self._decision_status.grid(row=f4._row, column=1, sticky="ew", pady=(0, S(10)))  # noqa: SLF001
-        f4._row += 1  # noqa: SLF001
-        drow4 = tk.Frame(c4.body, bg=P["surface"])
-        drow4.pack(fill="x")
-        ttk.Button(drow4, text="下载语义层权重（约 900MB）",
-                   command=self._download_decision).pack(side="left")
-        ttk.Button(drow4, text="重新检查", style="Ghost.TButton",
-                   command=self._check_decision).pack(side="left", padx=S(8))
+        c4.pack(fill="x", pady=(S(18), 0))
+        slot = c4.row("启用语义决策", "第 0 层的别名匹配搞不定的口语才走它。")
+        W.Switch(slot, "", self._decision_on).pack()
+        slot = c4.row("权重目录", "相对路径按 config.toml 所在目录解析。", stack=True)
+        W.Field(slot, textvariable=self._onnx_dir, mono=True).pack(fill="x")
+        slot = c4.row("checkpoint", "中文务必用 multilingual——用 english 的中文判断接近随机。")
+        W.Select(slot, variable=self._decision_model, values=DECISION_MODELS, width=180).pack()
+        slot = c4.row("置信度下限", "低于它就不执行，只在日志里说明。实测负样本落在 0.589，所以默认 0.6。")
+        self._confidence = NumberRow(slot, from_=0.0, to=1.0, fmt="{:.2f}", width=6)
+        self._confidence.pack()
+        self._decision_status = W.Callout(c4.body, "", "info", gap=(6, 0))
+        self._decision_status.pack(fill="x")
+        foot4 = tk.Frame(c4.body, bg=c4.fill)
+        foot4.pack(fill="x", pady=(S(14), 0))
+        W.Button(foot4, "下载语义层权重（约 900MB）", icon="download", command=self._download_decision).pack(
+            side="right")
+        W.Button(foot4, "重新检查", kind="ghost", icon="refresh", command=self._check_decision).pack(
+            side="right", padx=(0, S(8)))
         W.hint(
             c4.body,
             "语义层是第 1 层：第 0 层的别名匹配搞不定的口语才走它。"
             "它只该兜住漏网的输入，不该当主判据——官方 benchmark 里 20 选项意图任务只有 0.451。",
-        ).pack(fill="x", pady=(S(8), 0))
+            font="caption",
+        ).pack(fill="x", pady=(S(12), 0))
 
         # --- 网页 ---------------------------------------------------------
         c5w = W.Card(root, title="网页（说得出名字就能开）")
-        c5w.pack(fill="x", pady=(S(14), 0))
-        f5w = W.Form(c5w.body)
-        f5w.pack(fill="x")
-        W.check(f5w, "认出网站名字就打开（「打开百度」）", self._web_on, bg=P["surface"]).grid(
-            row=0, column=1, sticky="w", pady=(0, S(10))
-        )
-        f5w._row = 1  # noqa: SLF001 - 上面那行是手工 grid 的，把行号接上去
-        W.check(f5w, "没收录的名字退一步用搜索", self._web_search, bg=P["surface"]).grid(
-            row=f5w._row, column=1, sticky="w", pady=(0, S(10))  # noqa: SLF001
-        )
-        f5w._row += 1  # noqa: SLF001
-        f5w.add("搜索地址", ttk.Entry(f5w, textvariable=self._web_search_url),
-                note="必须有 {q} 占位符，查询词会填进去。")
+        c5w.pack(fill="x", pady=(S(18), 0))
+        slot = c5w.row("认出网站名字就打开", "「打开百度」这类。站点表是内置的，不联网。")
+        W.Switch(slot, "", self._web_on).pack()
+        slot = c5w.row("没收录的名字退一步用搜索", "这一步要联网——彻底离线用就把它关掉，「打开百度」照样能用。")
+        W.Switch(slot, "", self._web_search).pack()
+        slot = c5w.row("搜索地址", "必须有 {q} 占位符，查询词会填进去。", stack=True)
+        W.Field(slot, textvariable=self._web_search_url, mono=True).pack(fill="x")
         W.hint(
             c5w.body,
-            "站点表是内置的（约 70 个常见站，voice_ctl/web.py），不联网。"
-            "「搜索」那一步要联网——彻底离线用就把它关掉，「打开百度」照样能用。"
+            "站点表约 70 个常见站（voice_ctl/web.py）。"
             "本机装了同名的程序时以程序为先：说「打开微信」开的是微信，不是网页。",
-        ).pack(fill="x", pady=(S(8), 0))
+            font="caption",
+        ).pack(fill="x", pady=(S(12), 0))
 
         # --- 输出 ---------------------------------------------------------
         c5 = W.Card(root, title="输出")
-        c5.pack(fill="x", pady=(S(14), 0))
-        f5 = W.Form(c5.body)
-        f5.pack(fill="x")
-        W.check(f5, "把识别结果和执行情况写进日志", self._print_result, bg=P["surface"]).grid(
-            row=0, column=1, sticky="w", pady=(0, S(10))
-        )
-        f5._row = 1  # noqa: SLF001
-        W.hint(
-            c5.body,
-            "提示音（开始/结束那一声）在「快捷键」页里调。",
-        ).pack(fill="x")
-
-        # --- 底部 ---------------------------------------------------------
-        bar = tk.Frame(root, bg=P["bg"])
-        bar.pack(fill="x", pady=(S(18), 0))
-        ttk.Button(bar, text="保存全部修改", style="Primary.TButton",
-                   command=self._save).pack(side="left")
-        ttk.Button(bar, text="放弃修改", command=self.load_from_config).pack(side="left", padx=S(8))
-        ttk.Button(bar, text="重新加载配置文件", command=self.app.reload_config).pack(side="left")
-        ttk.Button(bar, text="打开 config.toml", style="Ghost.TButton",
-                   command=self._open_config).pack(side="right")
-        ttk.Button(bar, text="打开所在文件夹", style="Ghost.TButton",
-                   command=self._open_config_dir).pack(side="right", padx=S(8))
-
-        tk.Label(root, textvariable=self._status, bg=P["bg"], fg=P["faint"],
-                 font=W.theme.FONTS["tiny"], anchor="w", justify="left",
-                 wraplength=S(760)).pack(fill="x", pady=(S(10), 0))
+        c5.pack(fill="x", pady=(S(18), 0))
+        slot = c5.row("把识别结果和执行情况写进日志", "提示音（开始/结束那一声）在「快捷键」页里调。")
+        W.Switch(slot, "", self._print_result).pack()
 
     # -- 数据 ------------------------------------------------------------- #
 
@@ -291,14 +262,14 @@ class SettingsTab(tk.Frame):
             self._devices = list_input_devices()
         except RecorderError as e:
             self._devices = []
-            self._device_box.configure(values=["（枚举设备失败）"])
+            self._device_box.set_values(["（枚举设备失败）"])
             self._device.set("（枚举设备失败）")
             events.error(f"枚举麦克风失败：{e}", kind="ui")
             return
         labels = ["系统默认"]
-        for idx, name, rate, default in self._devices:
+        for idx, name, _rate, default in self._devices:
             labels.append(f"{'★ ' if default else ''}[{idx}] {name}")
-        self._device_box.configure(values=labels)
+        self._device_box.set_values(labels)
         cur = self.app.cfg.audio.device
         if cur is None:
             self._device.set("系统默认")
@@ -346,31 +317,51 @@ class SettingsTab(tk.Frame):
         model = md / "model.int8.onnx"
         if model.is_file():
             mb = model.stat().st_size / 1024 / 1024
-            self._model_status.configure(text=f"✓ 已就绪：{md}（{mb:.1f} MB）", fg=P["ok"])
+            self._model_status.set(f"已就绪：{md}（{mb:.1f} MB）", "ok")
         else:
-            self._model_status.configure(
-                text=f"✗ 缺少 model.int8.onnx（当前指向 {md}）——点下面的按钮下载", fg=P["error"]
+            self._model_status.set(
+                f"缺少 model.int8.onnx（当前指向 {md}）——点下面的按钮下载", "error"
             )
-        self._dl_btn.state(["!disabled"])
+        self._dl_btn.set_enabled(True)
         self._check_decision()
         self._status.set(
             f"配置文件：{self.app.config_path or '（没有配置文件，改动会新建一份）'}"
         )
 
     def _check_decision(self) -> None:
-        from ..decision import available
+        """重新检查语义层能不能用——**放在后台线程**。
+
+        `decision.available()` 为了判断"能不能用"会真的 import laya → torch，
+        实测第一次要 2–3 秒。放在 UI 线程里，就是用户第一次点「设置」整个界面冻几秒。
+        结果放进槽里，由 on_tick 画到提示条上（见 window.py 顶部的线程规则）。
+        """
         from ..runner import decision_dir_for
 
+        if self._decision_busy:
+            return
+        self._decision_busy = True
         # 用 decision_dir_for 而不是 cfg.decision_path()：后者不知道权重可能
         # 被内嵌在 _MEIPASS 里，会报"缺少权重"而实际是好的。
         root = decision_dir_for(self.app.cfg)
-        ok, reason = available(root)
-        color = P["ok"] if ok else P["muted"]
+        self._decision_status.set("正在检查语义层 …（第一次要几秒）", "info")
+
+        def work() -> None:
+            from ..decision import available
+
+            try:
+                self._decision_result = available(root)
+            except Exception as e:  # noqa: BLE001 - 检查本身出错也要让用户看到
+                self._decision_result = (False, f"检查语义层时出错：{type(e).__name__}: {e}")
+            finally:
+                self._decision_busy = False
+
+        threading.Thread(target=work, name="voice-ctl-decision-check", daemon=True).start()
+
+    def _show_decision(self, ok: bool, reason: str) -> None:
         extra = ""
         if not self.app.cfg.decision.enabled:
             extra = "（配置里没启用，不参与判断）"
-        self._decision_status.configure(text=f"{'✓' if ok else '·'} {reason} {extra}".strip(),
-                                        fg=color)
+        self._decision_status.set(f"{reason} {extra}".strip(), "ok" if ok else "info")
 
     # -- 组装新配置 ------------------------------------------------------- #
 
@@ -451,7 +442,7 @@ class SettingsTab(tk.Frame):
         from ..fetch import download_asr_model
 
         target = self.app.model_dir()
-        self._dl_btn.state(["disabled"])
+        self._dl_btn.set_enabled(False)
 
         def work() -> None:
             try:
@@ -534,6 +525,9 @@ class SettingsTab(tk.Frame):
         self._scroll.to_top()
 
     def on_tick(self) -> None:
+        res, self._decision_result = self._decision_result, None
+        if res is not None:
+            self._show_decision(*res)
         flag, self._reload_after = self._reload_after, None
         if flag == "model":
             self._after_download()
