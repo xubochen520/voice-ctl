@@ -191,6 +191,24 @@ Start-Process .\voice-ctl.exe -ArgumentList run -NoNewWindow
 （每次启动路径都不同），所以 `--status` 里的路径长得像
 `...\Temp\_MEI0000c8482\llama-runtime`，这是对的。
 
+## 改界面之后：截图看，别只看单测
+
+单测能保证"控件搭得起来、逻辑没断"，但**保证不了好不好看**——版式错位、
+颜色发闷、圆角发毛、文字掉行，这些只有看图才知道。改过 `voice_ctl/ui/` 就截一轮：
+
+```powershell
+.venv\Scripts\python.exe scripts\shot_ui.py <前缀> [页面,页面...]
+# -> _ui_<前缀>_{run,logs,hotkey,actions,settings,about}.png（已在 .gitignore 里）
+```
+
+纯 ctypes 抓窗口（`PrintWindow` + `PW_RENDERFULLCONTENT`）+ 自带 PNG 编码，
+**不依赖 Pillow**，所以不用为了截图动环境。窗口会临时置顶，抓完自己关。
+
+两个用它的理由：
+
+* **改前改后各截一轮**，对着看。没有"改前"，"改后"就没有判据。
+* 顺带验 DPI：`_shotcfg/` 里那份配置是脚本自己复制的，不会碰你的 `config.toml`。
+
 ## 四个必须显式处理的依赖
 
 PyInstaller 的 import 分析抓不全这些，漏了就是运行时 ImportError 或设备打不开：

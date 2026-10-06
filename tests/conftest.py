@@ -105,10 +105,16 @@ def tcl_root():
 
 
 @pytest.fixture()
-def app(cfg_path: Path, tcl_root):
-    from voice_ctl import events
+def app(cfg_path: Path, tcl_root, monkeypatch: pytest.MonkeyPatch):
+    from voice_ctl import decision, events
     from voice_ctl.config import load_config
     from voice_ctl.ui.window import build_window
+
+    # 界面测试不该真的 import torch。语义层可用性检查在后台线程里跑（见 ui/workers.py），
+    # 而测试里主线程只是 update() 轮询、不在 mainloop 里：_tkinter 对"非主线程调 Tcl"会先干等
+    # 主线程进入主循环（最多 1 秒）再报错——后台线程 import torch 期间每回收一个 tkinter 对象
+    # 就白等 1 秒，一次导入拖到半分钟以上。要测真实行为的用例自己再覆盖这个桩。
+    monkeypatch.setattr(decision, "available", lambda root: (False, "测试环境：不检查语义层"))
 
     win = tk.Toplevel(tcl_root)
     win.withdraw()

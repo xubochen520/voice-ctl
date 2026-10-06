@@ -11,6 +11,7 @@ from typing import Any
 from .. import __version__, bootstrap
 from . import gfx
 from . import widgets as W
+from .workers import HEAVY_IMPORT_LOCK
 from .theme import FONTS
 from .theme import PALETTE as P
 from .theme import S
@@ -190,7 +191,7 @@ class AboutTab(tk.Frame):
             buf = io.StringIO()
             args = build_parser().parse_args(["doctor"])
             try:
-                with contextlib.redirect_stdout(buf):
+                with HEAVY_IMPORT_LOCK, contextlib.redirect_stdout(buf):  # 体检会检查语义层（import torch）
                     cmd_doctor(args)
             except Exception as e:  # noqa: BLE001
                 buf.write(f"\n体检本身出错了：{type(e).__name__}: {e}\n")

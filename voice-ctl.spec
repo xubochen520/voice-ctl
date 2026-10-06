@@ -207,6 +207,7 @@ hiddenimports = [
     "voice_ctl.ui.textfit",
     "voice_ctl.ui.kit",
     "voice_ctl.ui.inputs",
+    "voice_ctl.ui.workers",
     "voice_ctl.ui.widgets",
     "voice_ctl.ui.tab_run",
     "voice_ctl.ui.tab_logs",

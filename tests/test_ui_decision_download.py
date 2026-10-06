@@ -190,11 +190,13 @@ def test_download_uses_resolved_dir_not_raw_config(app, monkeypatch: pytest.Monk
         return real(configured, *a, **k)
 
     monkeypatch.setattr(decision, "preflight_fetch", spy)
+    # 真预检会放行真下载（906MB）。这条测试只关心"传给 preflight 的是什么"，别真下
+    monkeypatch.setattr(decision, "fetch_weights", lambda root, which: [])
 
     app.show_tab("settings")
     tab = app.tabs["settings"]
     tab._download_decision()
-
-    assert calls, "界面没有调用 preflight_fetch —— 判断又被分叉了"
+    # 预检在后台线程里跑（它会 import torch，几秒）：等它真的调到
+    assert _wait_for(lambda: bool(calls), timeout=60), "界面没有调用 preflight_fetch —— 判断又被分叉了"
     # 传进去的应当是配置里那个值（相对路径），由 preflight 负责绝对化
     assert calls[0] == tab._onnx_dir.get().strip()
