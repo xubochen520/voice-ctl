@@ -133,6 +133,16 @@ VERSIONS = [
             "semantic": ROOT / "dist-semantic" / "voice-ctl-semantic.zip",
         },
     ),
+    (
+        "v0.3.6",
+        "voice-ctl 0.3.6 —— 界面重做",
+        "docs/RELEASE-NOTES-0.3.6.md",
+        {
+            "lite": ROOT / "dist" / "voice-ctl.exe",
+            "full": ROOT / "dist-full" / "voice-ctl.exe",
+            "semantic": ROOT / "dist-semantic" / "voice-ctl-semantic.zip",
+        },
+    ),
 ]
 
 

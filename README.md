@@ -20,13 +20,13 @@
 
 ## 下载
 
-最新版 **[v0.3.5](https://github.com/xubochen520/voice-ctl/releases/latest)**：
+最新版 **[v0.3.6](https://github.com/xubochen520/voice-ctl/releases/latest)**：
 
 | 产物 | 体积 | 说明 |
 |---|---|---|
-| [voice-ctl-0.3.5-win64-lite.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.5/voice-ctl-0.3.5-win64-lite.exe) | 84MB | **推荐**。首次用要跑一次 `voice-ctl download` 拉识别模型（226MB），之后每次启动都快一倍 |
-| [voice-ctl-0.3.5-win64-full.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.5/voice-ctl-0.3.5-win64-full.exe) | 236MB | 开箱即用，识别模型内嵌。代价是每次启动都要把 226MB 解包到临时目录 |
-| `voice-ctl-0.3.5-win64-semantic.zip` | 1.4GB | **完全离线**：连语义层和 906MB 权重都内置，什么都不用下。目录版（解压即用） |
+| [voice-ctl-0.3.6-win64-lite.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.6/voice-ctl-0.3.6-win64-lite.exe) | 85MB | **推荐**。首次用要跑一次 `voice-ctl download` 拉识别模型（226MB），之后每次启动都快一倍 |
+| [voice-ctl-0.3.6-win64-full.exe](https://github.com/xubochen520/voice-ctl/releases/download/v0.3.6/voice-ctl-0.3.6-win64-full.exe) | 237MB | 开箱即用，识别模型内嵌。代价是每次启动都要把 226MB 解包到临时目录 |
+| `voice-ctl-0.3.6-win64-semantic.zip` | 1.4GB | **完全离线**：连语义层和 906MB 权重都内置，什么都不用下。目录版（解压即用） |
 
 前两个都是单文件 exe，双击就出界面（命令行也一样用）。功能完全相同，只差识别模型是否内嵌。
 语义版是目录版，因为 1.8GB 每次启动都解包到临时目录不可接受。
@@ -40,6 +40,33 @@
 pip install -e .
 voice-ctl ui
 ```
+
+---
+
+## 0.3.6：界面重做
+
+原来那套是"能用的 tkinter 默认外观"。现在立了一个明确的视觉身份——
+**一台「按住说话」的设备的控制面：浅色机壳承载控件，深色屏幕承载机器输出。**
+
+六页全部重写，并自己写了一套绘制层（约 2200 行、**不引入任何新依赖**，
+只用已装的 numpy）：距离场抗锯齿光栅器、控件库、输入控件、中文换行避头尾。
+`textfit.py` 是必须自己写的——Tk 的 `wraplength` 只认空格，中文整段没有空格，
+它就在放不下的那个字处硬断，常常一行末尾只掉下来一个「。」。
+
+顺带把两个真瓶颈量出来并修掉：
+
+| 指标 | 重做前 | 重做后 |
+|---|---|---|
+| 切到设置页 | 3440 ms | **622 ms**（`import torch` 从 UI 线程挪到后台） |
+| 录音态 CPU | 12.9% | **5.9%**（点阵表 47ms/帧 → 3.1ms/帧） |
+| 空闲 CPU | 1.6% | 0.8% |
+| RSS（4000 条日志后） | 320 MB | 154 MB |
+
+还修了一个**打包版一开界面就崩**的缺陷（`apply_dark_titlebar` 改名后
+`exe_entry.py` 漏改；它只在打包入口里跑，没有任何测试 import 它），
+并加了通用守卫——跨模块引用指向不存在的属性就红。
+
+详见 [0.3.6 版本说明](docs/RELEASE-NOTES-0.3.6.md)。
 
 ---
 
